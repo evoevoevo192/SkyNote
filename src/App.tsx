@@ -31,6 +31,8 @@ import { PhotoLayer } from "./components/PhotoLayer";
 import { useFriends, type Person } from "./lib/friends";
 import type { EditMode } from "./lib/supabase";
 import { useBoards } from "./lib/boards";
+import { useDrawings } from "./lib/drawings";
+import { DrawingLayer, PencilIcon } from "./components/Drawing";
 import { useBackground } from "./lib/background";
 import { BackgroundDialog, BackgroundIcon, BoardBackground } from "./components/Background";
 import { NoteFullscreen } from "./components/NoteFullscreen";
@@ -183,6 +185,8 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   const [manageOpen, setManageOpen] = useState(false);
   const [fullId, setFullId] = useState<string | null>(null);
   const [bgOpen, setBgOpen] = useState(false);
+  const [drawMode, setDrawMode] = useState(false);
+  const drawings = useDrawings(userId);
   const background = useBackground(userId, bgOpen);
   const activeBoard = view === "shared" ? boardsApi.boards.find((b) => b.id === boardId) ?? null : null;
   const isBoardOwner = activeBoard?.owner_id === userId;
@@ -209,6 +213,9 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
       notify("Доска больше недоступна", "error");
     }
   }, [view, boardId, boardsApi.boards, boardsApi.loading, setBoardId, setView, notify]);
+  useEffect(() => {
+    if (view !== "private" && drawMode) setDrawMode(false);
+  }, [view, drawMode]);
   const openBoardsTab = () => {
     if (view !== "private") return;
     if (boardId && boardsApi.boards.some((b) => b.id === boardId)) setView("shared");
@@ -722,7 +729,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   useEffect(() => {
     if (!selectedPhotoId) return;
     const onKey = (e: KeyboardEvent) => {
-      if (viewerId || activeId || friendsOpen || profileOpen || newBoardOpen || manageOpen || fullId || bgOpen) return;
+      if (viewerId || activeId || friendsOpen || profileOpen || newBoardOpen || manageOpen || fullId || bgOpen || drawMode) return;
       const t = e.target as HTMLElement | null;
       const typing = !!t && (t.tagName === "TEXTAREA" || (t.tagName === "INPUT" && (t as HTMLInputElement).type === "text"));
       if (typing) return;
@@ -736,12 +743,12 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectedPhotoId, viewerId, activeId, friendsOpen, profileOpen, newBoardOpen, manageOpen, fullId, bgOpen]);
+  }, [selectedPhotoId, viewerId, activeId, friendsOpen, profileOpen, newBoardOpen, manageOpen, fullId, bgOpen, drawMode]);
 
   // Ctrl+V with an image in the clipboard adds a photo
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
-      if (activeId || friendsOpen || profileOpen || viewerId || newBoardOpen || manageOpen || fullId || bgOpen) return;
+      if (activeId || friendsOpen || profileOpen || viewerId || newBoardOpen || manageOpen || fullId || bgOpen || drawMode) return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
       const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
@@ -751,7 +758,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, [activeId, friendsOpen, profileOpen, viewerId, newBoardOpen, manageOpen, fullId, bgOpen, addPhotos]);
+  }, [activeId, friendsOpen, profileOpen, viewerId, newBoardOpen, manageOpen, fullId, bgOpen, drawMode, addPhotos]);
 
   const canDelete = (note: Note) =>
     note.user_id === userId ||
@@ -837,6 +844,22 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           {uploadingPhoto ? <span className="fr-spinner" aria-hidden="true" /> : <ImageIcon size={18} />}
           <span className="photo-btn-label">+ Фото</span>
         </button>
+        {view === "private" && (
+          <button
+            className={`tool-btn draw-btn-tb ${drawMode ? "active" : ""}`}
+            onClick={() => {
+              setActiveId(null);
+              setSelectedPhotoId(null);
+              setDrawMode((v) => !v);
+            }}
+            title="Рисовать на доске"
+            aria-label="Рисовать"
+            aria-pressed={drawMode}
+          >
+            <PencilIcon />
+            <span className="photo-btn-label">Рисовать</span>
+          </button>
+        )}
         <button className="tool-btn bg-btn" onClick={() => setBgOpen(true)} title="Фон доски" aria-label="Фон доски">
           <BackgroundIcon />
           <span className="photo-btn-label">Фон</span>
@@ -1124,8 +1147,8 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           if (file && target) replacePhoto(file, target);
         }}
       />
-      {!activeNote && !friendsOpen && !profileOpen && !newBoardOpen && !manageOpen && !fullId && !bgOpen && !viewerId && !selectedPhoto && (
-        <div className="fab-wrap">
+      {!activeNote && !friendsOpen && !profileOpen && !newBoardOpen && !manageOpen && !fullId && !bgOpen && !drawMode && !viewerId && !selectedPhoto && (
+        <div className="fab-wrap" hidden={drawMode}>
           {fabOpen && <div className="fab-backdrop" onClick={() => setFabOpen(false)} />}
           {fabOpen && (
             <div className="fab-menu" role="menu">
@@ -1139,6 +1162,20 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
               >
                 Новый стикер
               </button>
+              {view === "private" && (
+                <button
+                  role="menuitem"
+                  className="fab-item"
+                  onClick={() => {
+                    setFabOpen(false);
+                    setActiveId(null);
+                    setSelectedPhotoId(null);
+                    setDrawMode(true);
+                  }}
+                >
+                  <PencilIcon /> Рисовать
+                </button>
+              )}
               <button
                 role="menuitem"
                 className="fab-item"
@@ -1173,6 +1210,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           </button>
         </div>
       )}
+      {view === "private" && <DrawingLayer api={drawings} editing={drawMode} onDone={() => setDrawMode(false)} notify={notify} />}
       {bgOpen && <BackgroundDialog api={background} onClose={() => setBgOpen(false)} notify={notify} />}
       {newBoardOpen && (
         <NewBoardDialog

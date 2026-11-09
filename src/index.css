@@ -922,3 +922,54 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .bg-slider input[type="range"] { width: 100%; min-height: 44px; accent-color: var(--accent); }
 .bg-slider input:disabled { opacity: 0.4; }
 .bg-actions { display: flex; justify-content: space-between; gap: 10px; }
+
+/* ---------- Drawing ---------- */
+.fab-wrap[hidden] { display: none !important; }
+.tool-btn.draw-btn-tb.active { color: #fff; border-color: transparent; background: var(--accent); }
+.draw-canvas { position: fixed; inset: 0; z-index: 5; width: 100%; height: 100%; pointer-events: none; touch-action: none; }
+.draw-canvas.editing { pointer-events: auto; cursor: crosshair; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.draw-canvas.editing.tool-eraser { cursor: cell; }
+.draw-dock {
+  position: fixed;
+  left: 50%;
+  bottom: calc(14px + var(--safe-bottom));
+  z-index: 36;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px 10px;
+  width: max-content;
+  max-width: calc(100% - 24px);
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 28px;
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: 0 12px 34px rgba(0,0,0,0.28);
+  backdrop-filter: blur(18px);
+  transform: translateX(-50%);
+  touch-action: none;
+}
+.draw-group { display: flex; align-items: center; gap: 2px; }
+.draw-group.dim { opacity: 0.4; }
+.draw-btn { display: grid; place-items: center; width: 44px; height: 44px; border-radius: 14px; color: var(--text); background: transparent; transition: background 140ms ease-out; }
+.draw-btn:hover:not(:disabled) { background: var(--surface-soft); }
+.draw-btn.on { color: #fff; background: var(--accent); }
+.draw-btn.danger { color: #c0302b; }
+.draw-btn:disabled { opacity: 0.35; }
+.draw-w { display: block; border-radius: 999px; background: currentColor; }
+.draw-color { display: grid; place-items: center; width: 40px; height: 44px; background: transparent; }
+.draw-color span { display: block; width: 26px; height: 26px; border-radius: 999px; box-shadow: inset 0 0 0 1.5px rgba(0,0,0,0.3); transition: transform 140ms ease-out; }
+.draw-color.on span { transform: scale(1.18); box-shadow: inset 0 0 0 1.5px rgba(0,0,0,0.3), 0 0 0 3px var(--accent); }
+.draw-confirm { gap: 6px; font-size: 14px; font-weight: 600; }
+.draw-text { min-height: 44px; padding: 0 12px; border-radius: 14px; color: var(--text); background: var(--surface-soft); font-size: 14px; font-weight: 600; }
+.draw-text.danger { color: #fff; background: #c0302b; }
+.draw-status { min-width: 86px; color: var(--muted); font-size: 12px; text-align: center; }
+.draw-status.error { color: #c0302b; font-weight: 700; }
+.draw-done { display: grid; place-items: center; width: 52px; height: 52px; border-radius: 999px; color: #fff; background: var(--accent); box-shadow: 0 6px 16px rgba(91,91,240,0.4); }
+@media (max-width: 639px) {
+  .draw-dock { gap: 2px 6px; padding: 8px; border-radius: 24px; }
+  .draw-status { order: 9; min-width: 0; flex: 1; text-align: left; padding-left: 6px; }
+  .draw-done { order: 10; }
+}
