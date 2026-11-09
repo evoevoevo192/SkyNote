@@ -67,7 +67,7 @@ export function useDrawings(userId: string) {
     setSaveState("saving");
     const { error } = await supabase
       .from("drawings")
-      .upsert({ user_id: userId, board: "private", strokes: cur.current, updated_at: new Date().toISOString() }, { onConflict: "user_id" });
+      .upsert({ user_id: userId, strokes: cur.current, updated_at: new Date().toISOString() }, { onConflict: "user_id" });
     saving.current = false;
     if (error) {
       console.error("Стикеры: не удалось сохранить рисунок", error);

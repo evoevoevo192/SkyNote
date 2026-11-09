@@ -28,7 +28,9 @@ ALTER TABLE drawings ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON drawings FROM anon, authenticated;
 GRANT SELECT, DELETE ON drawings TO authenticated;
 GRANT INSERT (user_id, board, strokes, updated_at) ON drawings TO authenticated;
-GRANT UPDATE (strokes, updated_at) ON drawings TO authenticated;
+-- upsert (INSERT ... ON CONFLICT DO UPDATE) also SETs the columns it inserts, so they all need UPDATE.
+-- Changing user_id is still impossible: the RLS WITH CHECK requires user_id = auth.uid().
+GRANT UPDATE (user_id, board, strokes, updated_at) ON drawings TO authenticated;
 
 DROP POLICY IF EXISTS "drawings_select_own" ON drawings;
 CREATE POLICY "drawings_select_own" ON drawings FOR SELECT

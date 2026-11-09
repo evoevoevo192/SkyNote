@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   supabase,
   type Note,
@@ -9,6 +9,7 @@ import {
   type Board,
   NOTE_COLORS,
   NOTE_COLOR_HEX,
+  noteBg,
   NOTE_FONTS,
   NOTE_FONT_LABEL,
   FONT_STACK,
@@ -33,6 +34,10 @@ import type { EditMode } from "./lib/supabase";
 import { useBoards } from "./lib/boards";
 import { useDrawings } from "./lib/drawings";
 import { DrawingLayer, PencilIcon } from "./components/Drawing";
+import { useConnections } from "./lib/threads";
+import { useUiStyle } from "./lib/style";
+import { StyleButton } from "./components/StyleMenu";
+import { ThreadLayer, ThreadIcon } from "./components/Threads";
 import { useBackground } from "./lib/background";
 import { BackgroundDialog, BackgroundIcon, BoardBackground } from "./components/Background";
 import { NoteFullscreen } from "./components/NoteFullscreen";
@@ -43,8 +48,11 @@ const TILT_RANGE = 3; // degrees of random tilt per note
 
 type Theme = "light" | "dark";
 
-function randomTilt(): number {
-  return (Math.random() * 2 - 1) * TILT_RANGE;
+/** Stable tilt per note (a random value on every render made all stickers jitter and re-animate). */
+function noteTilt(id: string): number {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  return (((h >>> 0) % 2001) / 1000 - 1) * TILT_RANGE;
 }
 
 function preview(body: string): string {
@@ -187,6 +195,11 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   const [bgOpen, setBgOpen] = useState(false);
   const [drawMode, setDrawMode] = useState(false);
   const drawings = useDrawings(userId);
+  const uiStyle = useUiStyle(userId);
+  const [threadMode, setThreadMode] = useState(false);
+  const [pinFirst, setPinFirst] = useState<string | null>(null);
+  const [threadOpenId, setThreadOpenId] = useState<string | null>(null);
+  const threads = useConnections(view, boardId, userId);
   const background = useBackground(userId, bgOpen);
   const activeBoard = view === "shared" ? boardsApi.boards.find((b) => b.id === boardId) ?? null : null;
   const isBoardOwner = activeBoard?.owner_id === userId;
@@ -216,6 +229,50 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   useEffect(() => {
     if (view !== "private" && drawMode) setDrawMode(false);
   }, [view, drawMode]);
+  // threads only exist on the private and shared boards; drawing and threads are mutually exclusive
+  useEffect(() => {
+    if (view === "public" && threadMode) setThreadMode(false);
+  }, [view, threadMode]);
+  useEffect(() => {
+    setPinFirst(null);
+    setThreadOpenId(null);
+  }, [view, boardId, threadMode]);
+  useEffect(() => {
+    if (!threadMode) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !threadOpenId) setThreadMode(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [threadMode, threadOpenId]);
+  const toggleThreads = () => {
+    if (threadMode) {
+      setThreadMode(false);
+      return;
+    }
+    setActiveId(null);
+    setSelectedPhotoId(null);
+    setDrawMode(false);
+    setThreadMode(true);
+  };
+  const onPinTap = async (id: string) => {
+    if (!pinFirst) {
+      setPinFirst(id);
+      return;
+    }
+    if (pinFirst === id) {
+      setPinFirst(null);
+      return;
+    }
+    const first = pinFirst;
+    setPinFirst(null);
+    const r = await threads.create(first, id);
+    if (r.error) notify(r.error, "error");
+    else if (r.existed) {
+      notify("Между этими объектами уже есть нить");
+      if (r.conn) setThreadOpenId(r.conn.id);
+    } else if (r.conn) setThreadOpenId(r.conn.id);
+  };
   const openBoardsTab = () => {
     if (view !== "private") return;
     if (boardId && boardsApi.boards.some((b) => b.id === boardId)) setView("shared");
@@ -708,12 +765,24 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   const onPhotoClick = (note: Note) => {
     const p = press.current;
     press.current = null;
+    if (threadMode) return;
     if (p?.fired || p?.moved) return;
     if (isGridLayout()) setViewerId(note.id);
     else setSelectedPhotoId(note.id);
   };
 
-  const openNote = (id: string) => setActiveId(id);
+  const openNote = (id: string) => {
+    if (threadMode) return;
+    setActiveId(id);
+  };
+  const threadedIds = useMemo(() => {
+    const set = new Set<string>();
+    threads.items.forEach((c) => {
+      set.add(c.a_id);
+      set.add(c.b_id);
+    });
+    return set;
+  }, [threads.items]);
   useEffect(() => {
     setSelectedPhotoId(null);
     setConfirmPhotoId(null);
@@ -850,6 +919,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
             onClick={() => {
               setActiveId(null);
               setSelectedPhotoId(null);
+              setThreadMode(false);
               setDrawMode((v) => !v);
             }}
             title="Рисовать на доске"
@@ -858,6 +928,18 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           >
             <PencilIcon />
             <span className="photo-btn-label">Рисовать</span>
+          </button>
+        )}
+        {view !== "public" && (
+          <button
+            className={`tool-btn thread-btn-tb ${threadMode ? "active" : ""}`}
+            onClick={toggleThreads}
+            title="Красные нити между объектами"
+            aria-label="Нити"
+            aria-pressed={threadMode}
+          >
+            <ThreadIcon />
+            <span className="photo-btn-label">Нити</span>
           </button>
         )}
         <button className="tool-btn bg-btn" onClick={() => setBgOpen(true)} title="Фон доски" aria-label="Фон доски">
@@ -882,6 +964,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
         <button className="profile-btn" onClick={() => setProfileOpen(true)} title="Профиль" aria-label="Профиль">
           <Avatar name={me?.username ?? "?"} />
         </button>
+        <StyleButton style={uiStyle.style} onChange={uiStyle.setStyle} />
         {themeBtn}
         <button className="tool-btn" onClick={onSignOut} title="Выйти" aria-label="Выйти">
           <span aria-hidden="true">↪</span><span className="logout-label">Выйти</span>
@@ -976,6 +1059,15 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
                 onContextMenu={(e) => e.preventDefault()}
               >
                 <div className={`pc-paper${view === "shared" ? " with-author" : ""}`} style={{ transform: `rotate(${photoTilt(note.id)}deg)` }}>
+                <span
+                  className={`pin${threadMode ? " on" : ""}${pinFirst === note.id ? " first" : ""}${threadedIds.has(note.id) ? " threaded" : ""}`}
+                  data-pin-id={note.id}
+                  role={threadMode ? "button" : undefined}
+                  aria-label={threadMode ? "Булавка" : undefined}
+                  onPointerDown={threadMode ? (e) => e.stopPropagation() : undefined}
+                  onPointerUp={threadMode ? (e) => e.stopPropagation() : undefined}
+                  onClick={threadMode ? (e) => { e.stopPropagation(); onPinTap(note.id); } : undefined}
+                />
                   <PhotoFrame url={note.image_url} aspect={note.aspect ?? 1} caption={note.caption} />
                   {view === "shared" && note.user_id && profiles[note.user_id] && (
                     <div className="pc-author">— {profiles[note.user_id].username}</div>
@@ -997,15 +1089,24 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
               style={{
                 ["--note-x" as string]: `${note.pos_x}px`,
                 ["--note-y" as string]: `${note.pos_y}px`,
-                background: NOTE_COLOR_HEX[note.color],
-                ["--rot" as string]: `${randomTilt()}deg`,
-                transform: `rotate(${randomTilt()}deg)`,
+                background: noteBg(note.color),
+                ["--rot" as string]: `${noteTilt(note.id)}deg`,
+                transform: `rotate(calc(${noteTilt(note.id)}deg * var(--tilt-k, 1)))`,
                 fontFamily: FONT_STACK[note.font],
               }}
               onPointerDown={(e) => onStickyPointerDown(e, note)}
               onPointerUp={onStickyPointerUp}
               onClick={() => openNote(note.id)}
             >
+              <span
+                  className={`pin${threadMode ? " on" : ""}${pinFirst === note.id ? " first" : ""}${threadedIds.has(note.id) ? " threaded" : ""}`}
+                  data-pin-id={note.id}
+                  role={threadMode ? "button" : undefined}
+                  aria-label={threadMode ? "Булавка" : undefined}
+                  onPointerDown={threadMode ? (e) => e.stopPropagation() : undefined}
+                  onPointerUp={threadMode ? (e) => e.stopPropagation() : undefined}
+                  onClick={threadMode ? (e) => { e.stopPropagation(); onPinTap(note.id); } : undefined}
+                />
               <button
                 type="button"
                 className="sticky-expand"
@@ -1170,10 +1271,23 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
                     setFabOpen(false);
                     setActiveId(null);
                     setSelectedPhotoId(null);
+                    setThreadMode(false);
                     setDrawMode(true);
                   }}
                 >
                   <PencilIcon /> Рисовать
+                </button>
+              )}
+              {view !== "public" && (
+                <button
+                  role="menuitem"
+                  className="fab-item"
+                  onClick={() => {
+                    setFabOpen(false);
+                    toggleThreads();
+                  }}
+                >
+                  <ThreadIcon /> Нити
                 </button>
               )}
               <button
@@ -1209,6 +1323,26 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
             {uploadingPhoto ? <span className="fr-spinner" aria-hidden="true" /> : "+"}
           </button>
         </div>
+      )}
+      {threadMode && view !== "public" && !threadOpenId && (
+        <div className="thread-bar" role="status">
+          <span>{pinFirst ? "Коснитесь булавки второго объекта" : "Коснитесь булавок двух объектов"}</span>
+          <button type="button" className="thread-bar-done" onClick={() => setThreadMode(false)}>Готово</button>
+        </div>
+      )}
+      {view !== "public" && (
+        <ThreadLayer
+          api={threads}
+          active={threadMode}
+          visibleIds={new Set(visibleNotes.map((n) => n.id))}
+          userId={userId}
+          isBoardOwner={isBoardOwner}
+          openId={threadOpenId}
+          pinFirst={pinFirst}
+          onPin={onPinTap}
+          onOpen={setThreadOpenId}
+          notify={notify}
+        />
       )}
       {view === "private" && <DrawingLayer api={drawings} editing={drawMode} onDone={() => setDrawMode(false)} notify={notify} />}
       {bgOpen && <BackgroundDialog api={background} onClose={() => setBgOpen(false)} notify={notify} />}
@@ -1405,7 +1539,7 @@ function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode,
       <div
         className="note-paper"
         ref={paperRef}
-        style={{ background: NOTE_COLOR_HEX[color], fontFamily: FONT_STACK[font] }}
+        style={{ background: noteBg(color), fontFamily: FONT_STACK[font] }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="note-scroll">
@@ -1450,7 +1584,7 @@ function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode,
                 <button
                   key={c}
                   className={`color-dot ${c === color ? "active" : ""}`}
-                  style={{ background: NOTE_COLOR_HEX[c] }}
+                  style={{ background: noteBg(c) }}
                   onClick={() => canEdit && setColor(c)}
                   disabled={!canEdit}
                   aria-label={`Цвет ${c}`}

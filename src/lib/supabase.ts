@@ -99,6 +99,9 @@ export const NOTE_COLOR_HEX: Record<NoteColor, string> = {
   lavender: "#e3c9ff",
 };
 
+/** Sticker colour as a CSS value: the style may override it through --nc-<color>, the hex is the fallback. */
+export const noteBg = (c: NoteColor): string => `var(--nc-${c}, ${NOTE_COLOR_HEX[c]})`;
+
 export const NOTE_FONTS: NoteFont[] = [
   "default",
   "serif",

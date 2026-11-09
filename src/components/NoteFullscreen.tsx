@@ -3,6 +3,7 @@ import {
   FONT_STACK,
   NOTE_COLORS,
   NOTE_COLOR_HEX,
+  noteBg,
   NOTE_FONTS,
   NOTE_FONT_LABEL,
   type Note,
@@ -319,7 +320,7 @@ export function NoteFullscreen({ note, canEdit, canDelete, onClose, onChange, on
   };
 
   const style: React.CSSProperties = {
-    background: NOTE_COLOR_HEX[color],
+    background: noteBg(color),
     fontFamily: FONT_STACK[font],
     ...(vv ? { height: vv.h, top: vv.top, bottom: "auto" } : null),
     transform: dragY ? `translateY(${dragY}px)` : undefined,
@@ -402,7 +403,7 @@ export function NoteFullscreen({ note, canEdit, canDelete, onClose, onChange, on
                   <button
                     key={c}
                     className={`fs-dot ${c === color ? "active" : ""}`}
-                    style={{ background: NOTE_COLOR_HEX[c] }}
+                    style={{ background: noteBg(c) }}
                     onClick={() => pickColor(c)}
                     aria-label={`Цвет ${c}`}
                     aria-pressed={c === color}
@@ -439,7 +440,7 @@ export function NoteFullscreen({ note, canEdit, canDelete, onClose, onChange, on
                     aria-label="Цвет"
                     title="Цвет"
                   >
-                    <span className="fs-swatch" style={{ background: NOTE_COLOR_HEX[color] }} />
+                    <span className="fs-swatch" style={{ background: noteBg(color) }} />
                   </button>
                   <button
                     className={`fs-pbtn ${pop === "font" ? "on" : ""}`}
