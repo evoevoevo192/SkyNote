@@ -49,6 +49,7 @@ export interface Note {
   pos_y: number;
   board: Board;
   board_id?: string | null; // set only on shared boards
+  page?: number; // 1..10, page of the board (missing on old rows -> 1)
   edit_mode?: EditMode;
   user_id: string | null;
   font: NoteFont;

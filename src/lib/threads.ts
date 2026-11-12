@@ -7,6 +7,7 @@ export interface Connection {
   user_id: string;
   board: "private" | "shared";
   board_id: string | null;
+  page?: number;
   a_id: string;
   b_id: string;
   color: string;
@@ -23,6 +24,7 @@ export function threadErrorText(error: unknown): string {
   const m = error && typeof error === "object" && "message" in error ? String((error as { message?: unknown }).message ?? "") : "";
   if (m.includes("duplicate key")) return "Между этими объектами уже есть нить";
   if (m.includes("DIFFERENT_BOARDS")) return "Нить можно протянуть только между объектами одной доски";
+  if (m.includes("DIFFERENT_PAGES")) return "Нить можно протянуть только между объектами одной страницы";
   if (m.includes("NOT_ON_PUBLIC_BOARD")) return "На общей доске нити не поддерживаются";
   return "Не удалось выполнить действие с нитью";
 }

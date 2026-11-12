@@ -9,7 +9,7 @@ import type { BoardInfo } from "../lib/supabase";
 // ---------- chips row ----------
 interface ChipsProps {
   boards: BoardInfo[];
-  activeId: string | null; // null = the common (public) board
+  activeId: string | null;
   onPick: (id: string | null) => void;
   onNew: () => void;
   onManage: (id: string) => void;
@@ -18,9 +18,6 @@ interface ChipsProps {
 export function BoardChips({ boards, activeId, onPick, onNew, onManage }: ChipsProps) {
   return (
     <nav className="board-chips" aria-label="Доски">
-      <button className={`bchip ${activeId === null ? "active" : ""}`} onClick={() => onPick(null)}>
-        Общая
-      </button>
       {boards.map((b) => (
         <span key={b.id} className={`bchip-wrap ${activeId === b.id ? "active" : ""}`}>
           <button className="bchip" onClick={() => onPick(b.id)} title={b.name}>

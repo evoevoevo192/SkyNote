@@ -29,10 +29,13 @@ import {
 } from "./lib/photos";
 import { PhotoFrame, PhotoPanel, PhotoResizeHandle, PhotoViewer, ImageIcon, photoTilt } from "./components/Photos";
 import { PhotoLayer } from "./components/PhotoLayer";
-import { useFriends, type Person } from "./lib/friends";
+import { useFriends } from "./lib/friends";
 import type { EditMode } from "./lib/supabase";
 import { useBoards } from "./lib/boards";
 import { useDrawings } from "./lib/drawings";
+import { useBoardPages } from "./lib/pages";
+import { PageBar, PageMenu, MoveToPage } from "./components/Pages";
+import type { PageInfo } from "./lib/pages";
 import { DrawingLayer, PencilIcon } from "./components/Drawing";
 import { useConnections } from "./lib/threads";
 import { useUiStyle } from "./lib/style";
@@ -187,19 +190,37 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   const friendsApi = useFriends(userId);
   const [friendsOpen, setFriendsOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
-  const [authorFilter, setAuthorFilter] = useState<Person | null>(null);
   const boardsApi = useBoards(userId);
   const [newBoardOpen, setNewBoardOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
   const [fullId, setFullId] = useState<string | null>(null);
   const [bgOpen, setBgOpen] = useState(false);
   const [drawMode, setDrawMode] = useState(false);
-  const drawings = useDrawings(userId);
   const uiStyle = useUiStyle(userId);
   const [threadMode, setThreadMode] = useState(false);
   const [pinFirst, setPinFirst] = useState<string | null>(null);
   const [threadOpenId, setThreadOpenId] = useState<string | null>(null);
   const threads = useConnections(view, boardId, userId);
+  const notePages = useMemo(() => Array.from(new Set(notes.map((n) => n.page ?? 1))).sort((a, b) => a - b), [notes]);
+  const pagesApi = useBoardPages(view, boardId, userId, notePages);
+  const curPage = pagesApi.page;
+  const pageCounts = useMemo(() => {
+    const c: Record<number, number> = {};
+    notes.forEach((n) => {
+      const pg = n.page ?? 1;
+      c[pg] = (c[pg] ?? 0) + 1;
+    });
+    threads.items.forEach((t) => {
+      const pg = t.page ?? 1;
+      c[pg] = (c[pg] ?? 0) + 1;
+    });
+    return c;
+  }, [notes, threads.items]);
+  const [pageMenuOpen, setPageMenuOpen] = useState(false);
+  const lastPrivatePage = useRef(1);
+  if (view === "private") lastPrivatePage.current = curPage;
+  const drawings = useDrawings(userId, lastPrivatePage.current);
+  const visibleNotes = useMemo(() => notes.filter((n) => (n.page ?? 1) === curPage), [notes, curPage]);
   const background = useBackground(userId, bgOpen);
   const activeBoard = view === "shared" ? boardsApi.boards.find((b) => b.id === boardId) ?? null : null;
   const isBoardOwner = activeBoard?.owner_id === userId;
@@ -213,15 +234,12 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     const timer = setTimeout(() => setToast(null), 3200);
     return () => clearTimeout(timer);
   }, [toast]);
-  useEffect(() => {
-    if (view === "private") setAuthorFilter(null);
-  }, [view]);
   // the shared board disappeared (deleted by the owner, I was removed, or I left)
   useEffect(() => {
     if (view !== "shared" || boardsApi.loading) return;
     if (!boardsApi.boards.some((b) => b.id === boardId)) {
       setBoardId(null);
-      setView("public");
+      setView("private");
       setManageOpen(false);
       notify("Доска больше недоступна", "error");
     }
@@ -231,12 +249,12 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   }, [view, drawMode]);
   // threads only exist on the private and shared boards; drawing and threads are mutually exclusive
   useEffect(() => {
-    if (view === "public" && threadMode) setThreadMode(false);
+    if (view === "shared" && !boardId && threadMode) setThreadMode(false);
   }, [view, threadMode]);
   useEffect(() => {
     setPinFirst(null);
     setThreadOpenId(null);
-  }, [view, boardId, threadMode]);
+  }, [view, boardId, threadMode, pagesApi.page]);
   useEffect(() => {
     if (!threadMode) return;
     const onKey = (e: KeyboardEvent) => {
@@ -273,21 +291,29 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
       if (r.conn) setThreadOpenId(r.conn.id);
     } else if (r.conn) setThreadOpenId(r.conn.id);
   };
+  const movePage = (id: string, page: number) => {
+    const n = notesRef.current.find((x) => x.id === id);
+    if (!n || (n.page ?? 1) === page) return;
+    updateNote(id, { page });
+    setActiveId(null);
+    setSelectedPhotoId(null);
+    const idx = pagesApi.pages.findIndex((p) => p.page === page) + 1;
+    notify(`Перенесено на страницу ${idx}`);
+  };
   const openBoardsTab = () => {
     if (view !== "private") return;
     if (boardId && boardsApi.boards.some((b) => b.id === boardId)) setView("shared");
-    else setView("public");
+    else if (boardsApi.boards.length > 0) {
+      setBoardId(boardsApi.boards[0].id);
+      setView("shared");
+    } else {
+      setBoardId(null);
+      setView("shared"); // no boards yet: shows the "create a board" hint
+    }
   };
   const pickBoard = (id: string | null) => {
     setBoardId(id);
-    setView(id ? "shared" : "public");
-    setAuthorFilter(null);
-  };
-  const openFriendBoard = (person: Person) => {
-    setAuthorFilter(person);
-    setBoardId(null);
-    setView("public");
-    setFriendsOpen(false);
+    setView(id ? "shared" : "private");
   };
 
   // photo objects (notes with type = 'photo')
@@ -303,6 +329,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   const press = useRef<{ x: number; y: number; timer: number; fired: boolean; moved: boolean } | null>(null);
 
   const boardRef = useRef<HTMLDivElement>(null);
+  const swipeStart = useRef<{ x: number; y: number } | null>(null);
   const dragState = useRef<{ id: string; offsetX: number; offsetY: number } | null>(null);
 
   // load my profile
@@ -448,7 +475,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
             // someone else's change (collaborative sticker): take everything.
             const echo = mine !== -1 || textSig(old) === textSig(row);
             next[i] = echo
-              ? { ...old, pos_x: row.pos_x, pos_y: row.pos_y, edit_mode: row.edit_mode, updated_at: row.updated_at }
+              ? { ...old, pos_x: row.pos_x, pos_y: row.pos_y, page: row.page, edit_mode: row.edit_mode, updated_at: row.updated_at }
               : { ...old, ...row };
             return next;
           });
@@ -462,13 +489,14 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
 
   const activeNote = notes.find((n) => n.id === activeId) ?? null;
   const fullNote = notes.find((n) => n.id === fullId) ?? null;
-  const visibleNotes = authorFilter ? notes.filter((n) => n.user_id === authorFilter.id) : notes;
+  const noBoard = view === "shared" && !boardId;
   const selectedPhoto = notes.find((n) => n.id === selectedPhotoId && n.type === "photo") ?? null;
   const viewerPhotos = visibleNotes
     .filter((n) => n.type === "photo" && n.image_url)
     .map((n) => ({ id: n.id, url: n.image_url as string, caption: n.caption ?? null }));
 
   const createNote = useCallback(async () => {
+    if (view === "shared" && !boardId) return;
     const board = boardRef.current;
     const w = board?.clientWidth ?? window.innerWidth;
     const h = board?.clientHeight ?? window.innerHeight;
@@ -485,6 +513,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
         pos_x: x,
         pos_y: y,
         board: view,
+        page: curPage,
         ...(view === "shared" ? { board_id: boardId } : {}),
         font: "default",
       })
@@ -498,7 +527,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     const created = data as Note;
     setNotes((prev) => (prev.some((n) => n.id === created.id) ? prev : [created, ...prev]));
     setActiveId(created.id);
-  }, [view, boardId]);
+  }, [view, boardId, curPage]);
 
   const deleteNote = useCallback(
     async (id: string) => {
@@ -521,7 +550,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   );
 
   const updateNote = useCallback(
-    async (id: string, patch: Partial<Pick<Note, "title" | "body" | "color" | "pos_x" | "pos_y" | "font" | "edit_mode" | "image_path" | "image_fit" | "image_height" | "image_align" | "photos">>) => {
+    async (id: string, patch: Partial<Pick<Note, "title" | "body" | "color" | "pos_x" | "pos_y" | "font" | "edit_mode" | "image_path" | "image_fit" | "image_height" | "image_align" | "photos" | "page">>) => {
       const base = notesRef.current.find((n) => n.id === id);
       if (base) {
         const list = sentSigs.current.get(id) ?? [];
@@ -596,7 +625,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
 
   const addPhoto = useCallback(
     async (file: File) => {
-      if (view === "public" || (view === "shared" && !boardId)) {
+      if (view === "shared" && !boardId) {
         notify("Фото можно добавлять на личную доску и на доски с друзьями", "error");
         return;
       }
@@ -622,6 +651,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
             pos_x: x,
             pos_y: y,
             board: view,
+            page: curPage,
             ...(view === "shared" ? { board_id: boardId } : {}),
             font: "default",
             image_url: url,
@@ -646,7 +676,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
         setUploadingPhoto(false);
       }
     },
-    [view, boardId, userId, notify]
+    [view, boardId, userId, notify, curPage]
   );
 
   const addPhotos = useCallback(
@@ -900,14 +930,14 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
             Доски
           </button>
         </div>
-        <button className="tool-btn primary" onClick={createNote} disabled={loading}>
+        <button className="tool-btn primary" onClick={createNote} disabled={loading || noBoard}>
           + Новый стикер
         </button>
         <button
           className="tool-btn photo-btn"
           onClick={() => addInputRef.current?.click()}
-          disabled={loading || uploadingPhoto || view === "public"}
-          title={view !== "public" ? "Добавить фото" : "Фото добавляются на личную доску и на доски с друзьями"}
+          disabled={loading || uploadingPhoto || noBoard}
+          title="Добавить фото"
           aria-label="Добавить фото"
         >
           {uploadingPhoto ? <span className="fr-spinner" aria-hidden="true" /> : <ImageIcon size={18} />}
@@ -930,7 +960,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
             <span className="photo-btn-label">Рисовать</span>
           </button>
         )}
-        {view !== "public" && (
+        {!noBoard && (
           <button
             className={`tool-btn thread-btn-tb ${threadMode ? "active" : ""}`}
             onClick={toggleThreads}
@@ -991,7 +1021,19 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
             setSelectedPhotoId(null);
             setConfirmPhotoId(null);
             setFabOpen(false);
-          }
+            swipeStart.current = e.pointerType === "touch" && !drawMode && !threadMode ? { x: e.clientX, y: e.clientY } : null;
+          } else swipeStart.current = null;
+        }}
+        onPointerUp={(e) => {
+          const st = swipeStart.current;
+          swipeStart.current = null;
+          if (!st || noBoard) return;
+          const dx = e.clientX - st.x;
+          const dy = e.clientY - st.y;
+          if (Math.abs(dx) > 70 && Math.abs(dy) < Math.abs(dx) * 0.5) pagesApi.go(dx < 0 ? 1 : -1);
+        }}
+        onPointerCancel={() => {
+          swipeStart.current = null;
         }}
         onDragOver={(e) => {
           if (e.dataTransfer.types.includes("Files")) e.preventDefault();
@@ -1011,13 +1053,6 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           </div>
         )}
 
-        {authorFilter && (
-          <div className="author-chip">
-            <span>Доска: {authorFilter.username}</span>
-            <button onClick={() => setAuthorFilter(null)} aria-label="Показать все стикеры общей доски">×</button>
-          </div>
-        )}
-
         {loading && notes.length === 0 && (
           <div className="empty-hint">
             <div className="big">Загрузка…</div>
@@ -1026,12 +1061,17 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
 
         {!loading && visibleNotes.length === 0 && (
           <div className="empty-hint">
-            <div className="big">
-              {authorFilter
-                ? `У ${authorFilter.username} пока нет стикеров`
-                : view === "private" ? "Личная доска пустая" : view === "shared" ? `Доска «${activeBoard?.name ?? ""}» пустая` : "Общая доска пустая"}
-            </div>
-            {!authorFilter && <div>Нажмите «+ Новый стикер», чтобы начать</div>}
+            {noBoard ? (
+              <>
+                <div className="big">{boardsApi.boards.length === 0 ? "У вас пока нет досок с друзьями" : "Выберите доску"}</div>
+                {boardsApi.boards.length === 0 && <div>Нажмите «+ Новая доска» и пригласите друзей</div>}
+              </>
+            ) : (
+              <>
+                <div className="big">{pagesApi.pages.length > 1 ? "Страница пустая" : view === "private" ? "Личная доска пустая" : `Доска «${activeBoard?.name ?? ""}» пустая`}</div>
+                <div>Нажмите «+ Новый стикер», чтобы начать</div>
+              </>
+            )}
           </div>
         )}
 
@@ -1201,6 +1241,8 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           onClose={() => setActiveId(null)}
           onChange={(patch) => updateNote(activeNote.id, patch)}
           onDelete={() => deleteNote(activeNote.id)}
+          pages={pagesApi.pages}
+          onMovePage={(pg) => movePage(activeNote.id, pg)}
         />
       )}
       {selectedPhoto && !viewerId && !activeNote && (
@@ -1219,6 +1261,8 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           onDelete={() => deletePhoto(selectedPhoto)}
           canEdit={selectedPhoto.user_id === userId}
           canDelete={canDelete(selectedPhoto)}
+          pages={pagesApi.pages}
+          onMovePage={(pg) => movePage(selectedPhoto.id, pg)}
         />
       )}
       {viewerId && viewerPhotos.some((p) => p.id === viewerId) && (
@@ -1278,7 +1322,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
                   <PencilIcon /> Рисовать
                 </button>
               )}
-              {view !== "public" && (
+              {!noBoard && (
                 <button
                   role="menuitem"
                   className="fab-item"
@@ -1300,7 +1344,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
               >
                 <BackgroundIcon /> Фон
               </button>
-              {view !== "public" && (
+              {!noBoard && (
                 <button
                   role="menuitem"
                   className="fab-item"
@@ -1324,13 +1368,13 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           </button>
         </div>
       )}
-      {threadMode && view !== "public" && !threadOpenId && (
+      {threadMode && !noBoard && !threadOpenId && (
         <div className="thread-bar" role="status">
           <span>{pinFirst ? "Коснитесь булавки второго объекта" : "Коснитесь булавок двух объектов"}</span>
           <button type="button" className="thread-bar-done" onClick={() => setThreadMode(false)}>Готово</button>
         </div>
       )}
-      {view !== "public" && (
+      {!noBoard && (
         <ThreadLayer
           api={threads}
           active={threadMode}
@@ -1344,6 +1388,10 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           notify={notify}
         />
       )}
+      {!noBoard && !activeNote && !friendsOpen && !profileOpen && !newBoardOpen && !manageOpen && !fullId && !bgOpen && !drawMode && !threadMode && !viewerId && !selectedPhoto && (
+        <PageBar api={pagesApi} onMenu={() => setPageMenuOpen(true)} notify={notify} />
+      )}
+      {pageMenuOpen && <PageMenu api={pagesApi} counts={pageCounts} onClose={() => setPageMenuOpen(false)} notify={notify} />}
       {view === "private" && <DrawingLayer api={drawings} editing={drawMode} onDone={() => setDrawMode(false)} notify={notify} />}
       {bgOpen && <BackgroundDialog api={background} onClose={() => setBgOpen(false)} notify={notify} />}
       {newBoardOpen && (
@@ -1377,7 +1425,6 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           api={friendsApi}
           onClose={() => setFriendsOpen(false)}
           notify={notify}
-          onOpenBoard={openFriendBoard}
         />
       )}
       {profileOpen && (
@@ -1410,9 +1457,11 @@ interface NoteEditorProps {
   onClose: () => void;
   onChange: (patch: Partial<Pick<Note, "title" | "body" | "color" | "font" | "photos">>) => void;
   onDelete: () => void;
+  pages: PageInfo[];
+  onMovePage: (page: number) => void;
 }
 
-function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode, canDelete, onClose, onChange, onDelete }: NoteEditorProps) {
+function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode, canDelete, onClose, onChange, onDelete, pages, onMovePage }: NoteEditorProps) {
   const [title, setTitle] = useState(note.title);
   const [body, setBody] = useState(note.body);
   const [color, setColor] = useState<NoteColor>(note.color);
@@ -1659,6 +1708,7 @@ function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode,
 
         <div className="paper-foot">
           <div className="paper-actions">
+            {canEdit && isAuthor && <MoveToPage pages={pages} current={note.page ?? 1} onMove={onMovePage} />}
             {canEdit && isAuthor && photo && (
               <input
                 type="file"
@@ -1724,7 +1774,7 @@ function friendlyAuthError(error: unknown): string {
     return "Слишком много попыток. Подождите немного и попробуйте снова";
   }
   if (raw.includes("invalid login credentials")) return "Неверный email или пароль";
-  if (raw.includes("password") && (raw.includes("6") || raw.includes("short"))) return "Пароль должен содержать минимум 6 символов";
+  if (raw.includes("password") && (raw.includes("8") || raw.includes("short"))) return "Пароль должен содержать минимум 8 символов";
   if (raw.includes("profiles_username_lower_key") || raw.includes("duplicate key") || raw.includes("unique")) {
     return "Этот ник уже занят";
   }
@@ -1786,8 +1836,8 @@ function AuthScreen({ theme, onToggleTheme }: AuthScreenProps) {
       setUsernameError("Введите ник");
       return;
     }
-    if (password.length < 6) {
-      setPasswordError("Пароль должен содержать минимум 6 символов");
+    if (password.length < 8) {
+      setPasswordError("Пароль должен содержать минимум 8 символов");
       return;
     }
 
@@ -1907,7 +1957,7 @@ function AuthScreen({ theme, onToggleTheme }: AuthScreenProps) {
               type="text"
               value={username}
               onChange={(e) => { setUsername(e.target.value); setUsernameError(null); setRawError(null); }}
-              placeholder="Ваш ник на общей доске"
+              placeholder="Ваш ник для друзей"
               maxLength={24}
               autoFocus
               aria-invalid={Boolean(usernameError)}
@@ -1939,8 +1989,8 @@ function AuthScreen({ theme, onToggleTheme }: AuthScreenProps) {
               value={password}
               onChange={(e) => { setPassword(e.target.value); setPasswordError(null); setRawError(null); }}
               autoComplete={mode === "login" ? "current-password" : "new-password"}
-              placeholder={mode === "login" ? "Пароль" : "Минимум 6 символов"}
-              minLength={6}
+              placeholder={mode === "login" ? "Пароль" : "Минимум 8 символов"}
+              minLength={8}
               aria-invalid={Boolean(passwordError)}
             />
             <button type="button" className="password-toggle" onClick={() => setShowPassword((visible) => !visible)} aria-label={showPassword ? "Скрыть пароль" : "Показать пароль"}>

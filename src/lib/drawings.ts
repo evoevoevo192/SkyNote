@@ -43,7 +43,7 @@ function sanitize(raw: unknown): Stroke[] {
 export type SaveState = "idle" | "saving" | "saved" | "error";
 
 /** Strokes of the private board: undo/redo history, debounced autosave (800 ms), reload on focus. */
-export function useDrawings(userId: string) {
+export function useDrawings(userId: string, page = 1) {
   const [strokes, setStrokesState] = useState<Stroke[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -53,6 +53,8 @@ export function useDrawings(userId: string) {
   const timer = useRef<number | null>(null);
   const dirty = useRef(false);
   const saving = useRef(false);
+  const pageRef = useRef(page);
+  const shownPage = useRef(page);
 
   const save = useCallback(async () => {
     if (timer.current) window.clearTimeout(timer.current);
@@ -65,13 +67,14 @@ export function useDrawings(userId: string) {
     dirty.current = false;
     saving.current = true;
     setSaveState("saving");
+    const pg = pageRef.current;
     const { error } = await supabase
       .from("drawings")
-      .upsert({ user_id: userId, strokes: cur.current, updated_at: new Date().toISOString() }, { onConflict: "user_id" });
+      .upsert({ user_id: userId, page: pg, strokes: cur.current, updated_at: new Date().toISOString() }, { onConflict: "user_id,page" });
     saving.current = false;
     if (error) {
       console.error("Стикеры: не удалось сохранить рисунок", error);
-      dirty.current = true;
+      if (pageRef.current === pg) dirty.current = true;
       setSaveState("error");
     } else {
       setSaveState(dirty.current ? "saving" : "saved");
@@ -120,15 +123,17 @@ export function useDrawings(userId: string) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [schedule]);
 
-  const load = useCallback(async () => {
-    if (dirty.current || saving.current) return;
-    const { data, error } = await supabase.from("drawings").select("strokes").eq("user_id", userId).maybeSingle();
+  const load = useCallback(async (force = false) => {
+    if (!force && (dirty.current || saving.current)) return;
+    const pg = pageRef.current;
+    const { data, error } = await supabase.from("drawings").select("strokes").eq("user_id", userId).eq("page", pg).maybeSingle();
     if (error) {
       console.error("Стикеры: не удалось загрузить рисунок", error);
       setLoaded(true);
       return;
     }
-    if (dirty.current || saving.current) return;
+    if (pageRef.current !== pg) return;
+    if (dirty.current || (!force && saving.current)) return;
     const remote = sanitize((data as { strokes?: unknown } | null)?.strokes);
     if (JSON.stringify(remote) !== JSON.stringify(cur.current)) {
       cur.current = remote;
@@ -139,7 +144,20 @@ export function useDrawings(userId: string) {
   }, [userId]);
 
   useEffect(() => {
-    load();
+    // (the cleanup of the previous run has already saved the old page: pageRef still holds it)
+    pageRef.current = page;
+    if (shownPage.current !== page) {
+      shownPage.current = page;
+      cur.current = [];
+      setStrokesState([]);
+      hist.current = { stack: [[]], idx: 0 };
+      dirty.current = false;
+      setLoaded(false);
+      setSaveState("idle");
+      void load(true);
+    } else {
+      void load();
+    }
     const onFocus = () => load();
     const onHide = () => {
       if (dirty.current) void save();
@@ -153,7 +171,7 @@ export function useDrawings(userId: string) {
       document.removeEventListener("visibilitychange", onHide);
       if (dirty.current) void save();
     };
-  }, [load, save]);
+  }, [load, save, page]);
 
   const h = hist.current;
   return {

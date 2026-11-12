@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Стикеры</title>
+    <script>
+      // apply style and theme before the first paint (no flash)
+      try {
+        var d = document.documentElement;
+        var st = localStorage.getItem("sticky-style");
+        if (st === "original" || st === "modern" || st === "skeuo") d.setAttribute("data-style", st);
+        var th = localStorage.getItem("theme");
+        if (th !== "light" && th !== "dark") th = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        d.setAttribute("data-theme", th);
+      } catch (e) {}
+    </script>
+    <!-- handwriting font for the "Скевоморфизм" style; non-blocking, falls back to system handwriting fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Marck+Script&display=swap&subset=cyrillic" media="print" onload="this.media='all'" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

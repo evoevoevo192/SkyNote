@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { MoveToPage } from "./Pages";
+import type { PageInfo } from "../lib/pages";
 import {
   PHOTO_CAPTION_MAX,
   PHOTO_DEFAULT_W,
@@ -110,9 +112,11 @@ interface PhotoPanelProps {
   /** false for someone else's photo on a shared board: only open / delete (owner) */
   canEdit?: boolean;
   canDelete?: boolean;
+  pages?: PageInfo[];
+  onMovePage?: (page: number) => void;
 }
 
-export function PhotoPanel({ note, confirming, onConfirming, onWidth, onCaption, onReplace, onOpen, onDelete, canEdit = true, canDelete = true }: PhotoPanelProps) {
+export function PhotoPanel({ note, confirming, onConfirming, onWidth, onCaption, onReplace, onOpen, onDelete, canEdit = true, canDelete = true, pages = [], onMovePage }: PhotoPanelProps) {
   const ref = useRef<HTMLDivElement>(null);
   const [captionOpen, setCaptionOpen] = useState(false);
   const [draft, setDraft] = useState(note.caption ?? "");
@@ -227,12 +231,19 @@ export function PhotoPanel({ note, confirming, onConfirming, onWidth, onCaption,
           <button className="pp-btn danger" onClick={onDelete}>Удалить</button>
         </div>
       ) : (
+        <>
+        {canEdit && onMovePage && pages.length > 1 && (
+          <div className="pp-row">
+            <MoveToPage pages={pages} current={note.page ?? 1} onMove={onMovePage} className="in-panel" />
+          </div>
+        )}
         <div className="pp-row pp-actions">
           {canEdit && <button className={`pp-btn ${captionOpen ? "active" : ""}`} onClick={() => setCaptionOpen((v) => !v)}>Подпись</button>}
           {canEdit && <button className="pp-btn" onClick={onReplace}>Заменить</button>}
           <button className="pp-btn" onClick={onOpen}>Открыть</button>
           {canDelete && <button className="pp-btn danger" onClick={() => onConfirming(true)} aria-label="Удалить фото">Удалить</button>}
         </div>
+        </>
       )}
     </div>
   );

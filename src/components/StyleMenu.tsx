@@ -17,7 +17,7 @@ export function PaletteIcon({ size = 18 }: { size?: number }) {
 const CARDS: { id: UIStyle; name: string; hint: string }[] = [
   { id: "modern", name: "Современный", hint: "Мягкие цвета и стекло" },
   { id: "original", name: "Оригинал", hint: "Плоская бумага на сером" },
-  { id: "skeuo", name: "Скевоморфизм", hint: "Пробка, кожа, бумага (iOS 6)" },
+  { id: "skeuo", name: "Скевоморфизм", hint: "Пробка, кожа, бумага" },
 ];
 
 interface Props {

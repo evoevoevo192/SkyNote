@@ -115,10 +115,9 @@ interface FriendsDialogProps {
   api: FriendsApi;
   onClose: () => void;
   notify: Notify;
-  onOpenBoard: (person: Person) => void;
 }
 
-export function FriendsDialog({ api, onClose, notify, onOpenBoard }: FriendsDialogProps) {
+export function FriendsDialog({ api, onClose, notify }: FriendsDialogProps) {
   const [tab, setTab] = useState<Tab>("friends");
   const [menuId, setMenuId] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<{ id: string; kind: "remove" | "block" } | null>(null);
@@ -254,9 +253,6 @@ export function FriendsDialog({ api, onClose, notify, onOpenBoard }: FriendsDial
                         </div>
                       ) : (
                         <>
-                          <button className="fr-menu-item" onClick={() => onOpenBoard(f.person)}>
-                            Открыть доску
-                          </button>
                           <button className="fr-menu-item danger" onClick={() => setConfirm({ id: f.friendshipId, kind: "remove" })}>
                             Удалить из друзей
                           </button>
@@ -456,7 +452,7 @@ export function ProfileDialog({ username, api, onClose, notify }: ProfileDialogP
           <Avatar name={username || "?"} />
           <div className="fr-info">
             <div className="fr-name">{username || "Без ника"}</div>
-            <div className="fr-sub">Ваш ник на общей доске</div>
+            <div className="fr-sub">Ваш ник для друзей</div>
           </div>
         </div>
 
