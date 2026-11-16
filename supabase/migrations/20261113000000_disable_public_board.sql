@@ -26,5 +26,17 @@ CREATE POLICY "notes_insert" ON notes FOR INSERT
 DROP POLICY IF EXISTS "notes_update" ON notes;
 CREATE POLICY "notes_update" ON notes FOR UPDATE
   TO authenticated
-  USING (user_id = auth.uid() AND board <> 'public' AND (board <> 'shared' OR is_board_member(board_id)))
-  WITH CHECK (user_id = auth.uid() AND board <> 'public');
+  USING (
+    board <> 'public'
+    AND (
+      (user_id = auth.uid() AND (board <> 'shared' OR is_board_member(board_id)))
+      OR (board = 'shared' AND edit_mode = 'members' AND type <> 'photo' AND is_board_member(board_id))
+    )
+  )
+  WITH CHECK (
+    board <> 'public'
+    AND (
+      user_id = auth.uid()
+      OR (board = 'shared' AND edit_mode = 'members' AND type <> 'photo' AND is_board_member(board_id))
+    )
+  );

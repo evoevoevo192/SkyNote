@@ -20,7 +20,7 @@ import {
 } from "./lib/supabase";
 import {
   uploadPhoto,
-  removePhotoPaths,
+  removeStickerPhoto,
   defaultPhotosFromLegacy,
   uploadBoardPhoto,
   removeBoardPhoto,
@@ -35,6 +35,10 @@ import { useBoards } from "./lib/boards";
 import { useDrawings } from "./lib/drawings";
 import { useBoardPages } from "./lib/pages";
 import { PageBar, PageMenu, MoveToPage } from "./components/Pages";
+import { ExportSheet } from "./components/Export";
+import { ReminderDialog, BellIcon } from "./components/Reminders";
+import { useReminders, useReminderRunner, setReminder } from "./lib/reminders";
+import type { ExportInput } from "./lib/export";
 import type { PageInfo } from "./lib/pages";
 import { DrawingLayer, PencilIcon } from "./components/Drawing";
 import { useConnections } from "./lib/threads";
@@ -44,8 +48,14 @@ import { ThreadLayer, ThreadIcon } from "./components/Threads";
 import { useBackground } from "./lib/background";
 import { BackgroundDialog, BackgroundIcon, BoardBackground } from "./components/Background";
 import { NoteFullscreen } from "./components/NoteFullscreen";
-import { BoardChips, NewBoardDialog, BoardDialog } from "./components/Boards";
+import { BoardChips, BoardOffer, NewBoardDialog, BoardDialog } from "./components/Boards";
 import { FriendsDialog, ProfileDialog, ToastView, Avatar, FriendsIcon, type Toast } from "./components/Friends";
+import { local, useTable, useBlobTick, localUrl } from "./lib/localdb";
+import { sync, useOnline, onSyncDropped, holdIds } from "./lib/sync";
+import { noteCreate, notePatch, noteMoveLive, noteMoveDone, noteDelete, drawKey } from "./lib/data";
+import { SyncBadge, OfflineBanner } from "./components/SyncUi";
+import { LockDialog, LockIcon, type LockDialogKind } from "./components/Locks";
+import { useLockSessions, openedContent, isOpened, relock, relockAll, saveOpened, lockMessage } from "./lib/locks";
 
 const TILT_RANGE = 3; // degrees of random tilt per note
 
@@ -85,30 +95,58 @@ type AuthState =
   | { kind: "signed-out" }
   | { kind: "signed-in"; userId: string; email: string };
 
+const LAST_USER_KEY = "sticky-last-user";
+let signOutRequested = false;
+
+function readLastUser(): { userId: string; email: string } | null {
+  try {
+    const v = JSON.parse(localStorage.getItem(LAST_USER_KEY) || "null");
+    if (v && typeof v.userId === "string") return { userId: v.userId, email: typeof v.email === "string" ? v.email : "" };
+  } catch {
+    /* storage may be unavailable */
+  }
+  return null;
+}
+function rememberUser(userId: string, email: string) {
+  try {
+    localStorage.setItem(LAST_USER_KEY, JSON.stringify({ userId, email }));
+  } catch {
+    /* storage may be unavailable */
+  }
+}
+
+/** The login is kept on the device: without a network the app opens as the last signed-in user. */
 function useAuth() {
   const [state, setState] = useState<AuthState>({ kind: "loading" });
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      if (data.session) {
-        setState({
-          kind: "signed-in",
-          userId: data.session.user.id,
-          email: data.session.user.email ?? "",
-        });
-      } else {
-        setState({ kind: "signed-out" });
+    const signedIn = (userId: string, email: string) => {
+      rememberUser(userId, email);
+      setState((cur) => (cur.kind === "signed-in" && cur.userId === userId ? cur : { kind: "signed-in", userId, email }));
+    };
+    const offlineFallback = () => {
+      const last = readLastUser();
+      if (last && !signOutRequested) {
+        setState({ kind: "signed-in", userId: last.userId, email: last.email });
+        return true;
       }
-    });
+      return false;
+    };
+    supabase.auth
+      .getSession()
+      .then(({ data, error }) => {
+        if (data.session) signedIn(data.session.user.id, data.session.user.email ?? "");
+        else if (!((error || !navigator.onLine) && offlineFallback())) setState({ kind: "signed-out" });
+      })
+      .catch(() => {
+        if (!offlineFallback()) setState({ kind: "signed-out" });
+      });
 
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (session) {
-        setState({
-          kind: "signed-in",
-          userId: session.user.id,
-          email: session.user.email ?? "",
-        });
-      } else {
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      if (session) signedIn(session.user.id, session.user.email ?? "");
+      else if (event === "SIGNED_OUT") {
+        // a failed token refresh without network is not a sign-out
+        if (!signOutRequested && !navigator.onLine) return;
         setState({ kind: "signed-out" });
       }
     });
@@ -119,9 +157,48 @@ function useAuth() {
   return state;
 }
 
+/** Opens the local database of the user and starts the synchronisation. */
+function useLocalReady(userId: string | null): boolean {
+  const [ready, setReady] = useState<string | null>(null);
+  useEffect(() => {
+    if (!userId) {
+      setReady(null);
+      return;
+    }
+    let dead = false;
+    sync.start(userId).then(() => {
+      if (!dead) setReady(userId);
+    });
+    return () => {
+      dead = true;
+    };
+  }, [userId]);
+  return !!userId && ready === userId;
+}
+
+async function signOutAndForget() {
+  signOutRequested = true;
+  try {
+    localStorage.removeItem(LAST_USER_KEY);
+  } catch {
+    /* storage may be unavailable */
+  }
+  sync.stop();
+  await local.flush();
+  await local.wipe();
+  try {
+    const { error } = await supabase.auth.signOut();
+    if (error) await supabase.auth.signOut({ scope: "local" }); // offline: at least forget the session on this device
+  } catch {
+    await supabase.auth.signOut({ scope: "local" }).catch(() => undefined);
+  }
+  window.location.reload();
+}
+
 // ---------- main app ----------
 export default function App() {
   const auth = useAuth();
+  const dbReady = useLocalReady(auth.kind === "signed-in" ? auth.userId : null);
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem("theme") as Theme | null;
     if (saved === "light" || saved === "dark") return saved;
@@ -135,7 +212,7 @@ export default function App() {
     localStorage.setItem("theme", theme);
   }, [theme]);
 
-  if (auth.kind === "loading") {
+  if (auth.kind === "loading" || (auth.kind === "signed-in" && !dbReady)) {
     return (
       <div className="login-wrap">
         <p className="login-subtitle">Загрузка…</p>
@@ -161,7 +238,11 @@ export default function App() {
       boardId={boardId}
       setBoardId={setBoardId}
       userId={auth.userId}
-      onSignOut={() => supabase.auth.signOut()}
+      onSignOut={() => {
+        const waiting = local.ops.filter((o) => o.table !== "upload").length;
+        if (waiting > 0 && !window.confirm(`Есть неотправленные изменения (${waiting}). Если выйти сейчас, они будут потеряны. Выйти?`)) return;
+        void signOutAndForget();
+      }}
     />
   );
 }
@@ -179,12 +260,27 @@ interface BoardAppProps {
 }
 
 function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, userId, onSignOut }: BoardAppProps) {
-  const [notes, setNotes] = useState<Note[]>([]);
-  const [profiles, setProfiles] = useState<Record<string, Profile>>({});
-  const [me, setMe] = useState<Profile | null>(null);
-  const [loading, setLoading] = useState(true);
+  // everything is read from the local database: instant and works without a network
+  const allNotes = useTable(local.notes);
+  const profileRows = useTable(local.profiles);
+  const profiles = useMemo(() => Object.fromEntries(profileRows.map((p) => [p.id, p])) as Record<string, Profile>, [profileRows]);
+  const me: Profile | null = profiles[userId] ?? null;
+  const online = useOnline();
+  useBlobTick(); // photos that are not uploaded yet
+  const notes = useMemo(
+    () =>
+      allNotes
+        .filter((n) => (view === "shared" ? !!boardId && n.board_id === boardId : n.board === view && !n.board_id))
+        .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0)) as Note[],
+    [allNotes, view, boardId]
+  );
+  const loading = false;
+  // friends' and shared boards are read-only without a network (the personal board always works)
+  const readOnly = view === "shared" && !online;
   const [error, setError] = useState<string | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [lockDlg, setLockDlg] = useState<{ kind: LockDialogKind; id: string } | null>(null);
+  const lockVer = useLockSessions(); // re-render when a locked sticker is opened or closed
 
   // friends
   const friendsApi = useFriends(userId);
@@ -192,6 +288,11 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   const [profileOpen, setProfileOpen] = useState(false);
   const boardsApi = useBoards(userId);
   const [newBoardOpen, setNewBoardOpen] = useState(false);
+  const [newBoardMode, setNewBoardMode] = useState<"solo" | "friends">("solo");
+  const openNewBoard = (mode: "solo" | "friends") => {
+    setNewBoardMode(mode);
+    setNewBoardOpen(true);
+  };
   const [manageOpen, setManageOpen] = useState(false);
   const [fullId, setFullId] = useState<string | null>(null);
   const [bgOpen, setBgOpen] = useState(false);
@@ -217,6 +318,9 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     return c;
   }, [notes, threads.items]);
   const [pageMenuOpen, setPageMenuOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [remindFor, setRemindFor] = useState<string | null>(null);
+  const reminders = useReminders();
   const lastPrivatePage = useRef(1);
   if (view === "private") lastPrivatePage.current = curPage;
   const drawings = useDrawings(userId, lastPrivatePage.current);
@@ -229,6 +333,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     (text: string, kind: "success" | "error" = "success") => setToast({ id: Date.now(), text, kind }),
     []
   );
+  useReminderRunner(allNotes as Note[], true, notify); // all boards: a reminder is personal
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(null), 3200);
@@ -237,7 +342,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   // the shared board disappeared (deleted by the owner, I was removed, or I left)
   useEffect(() => {
     if (view !== "shared" || boardsApi.loading) return;
-    if (!boardsApi.boards.some((b) => b.id === boardId)) {
+    if (boardId && !boardsApi.boards.some((b) => b.id === boardId)) {
       setBoardId(null);
       setView("private");
       setManageOpen(false);
@@ -331,9 +436,14 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   const boardRef = useRef<HTMLDivElement>(null);
   const swipeStart = useRef<{ x: number; y: number } | null>(null);
   const dragState = useRef<{ id: string; offsetX: number; offsetY: number } | null>(null);
+  const dragMoved = useRef(false);
 
   // load my profile
   useEffect(() => {
+    if (!online || local.profiles.get(userId)) {
+      if (local.profiles.get(userId)) localStorage.removeItem("pending-sticky-profile");
+      return;
+    }
     (async () => {
       const { data } = await supabase
         .from("profiles")
@@ -341,7 +451,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
         .eq("id", userId)
         .maybeSingle();
       if (data) {
-        setMe(data as Profile);
+        local.profiles.put(data as Profile);
         localStorage.removeItem("pending-sticky-profile");
         return;
       }
@@ -365,13 +475,13 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           .select("id, username, is_admin, created_at")
           .eq("id", userId)
           .maybeSingle();
-        if (createdProfile) setMe(createdProfile as Profile);
+        if (createdProfile) local.profiles.put(createdProfile as Profile);
       } catch (profileFailure) {
         console.error("Стикеры: ошибка восстановления профиля", profileFailure);
         setError("Не удалось завершить создание профиля. Выйдите и войдите снова.");
       }
     })();
-  }, [userId]);
+  }, [userId, online]);
 
   useEffect(() => {
     if (!error) return;
@@ -379,200 +489,108 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     return () => clearTimeout(timer);
   }, [error]);
 
-  // load notes for current view + all author profiles
-  const loadNotes = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    if (view === "shared" && !boardId) {
-      setNotes([]);
-      setLoading(false);
-      return;
-    }
-    let query = supabase.from("notes").select("*");
-    query = view === "shared" ? query.eq("board_id", boardId as string) : query.eq("board", view);
-    const { data, error } = await query.order("created_at", { ascending: false });
-    if (error) {
-      setError("Не удалось загрузить заметки");
-      console.error(error);
-    } else {
-      const rows = (data ?? []) as Note[];
-      setNotes(rows);
-      // fetch profiles for authors we don't have yet
-      const ids = Array.from(
-        new Set(rows.map((r) => r.user_id).filter((id): id is string => id !== null))
-      );
-      const missing = ids.filter((id) => !profiles[id]);
-      if (missing.length) {
-        const { data: pdata } = await supabase
-          .from("profiles")
-          .select("id, username, is_admin, created_at")
-          .in("id", missing);
-        if (pdata) {
-          setProfiles((prev) => {
-            const next = { ...prev };
-            for (const p of pdata as Profile[]) next[p.id] = p;
-            return next;
-          });
-        }
-      }
-    }
-    setLoading(false);
-  }, [view, boardId, profiles]);
-
-  useEffect(() => {
-    loadNotes();
-  }, [loadNotes]);
-
-  // ---- Realtime: other people's changes arrive without reloading ----
-  const sentSigs = useRef<Map<string, string[]>>(new Map());
   const notesRef = useRef<Note[]>([]);
   notesRef.current = notes;
-  const ensureProfile = useCallback(async (id: string | null) => {
-    if (!id) return;
-    const { data } = await supabase.from("profiles").select("id, username, is_admin, created_at").eq("id", id).maybeSingle();
-    if (data) setProfiles((prev) => (prev[id] ? prev : { ...prev, [id]: data as Profile }));
-  }, []);
-
+  // the server refused one of my queued changes
+  useEffect(() => onSyncDropped((text) => notify(text, "error")), [notify]);
+  // a note that disappeared (deleted by someone else) closes its editor / viewer
   useEffect(() => {
-    if (view === "shared" && !boardId) return;
-    const matches = (n: Partial<Note>) => (view === "shared" ? n.board_id === boardId : n.board === view);
-    const channel = supabase
-      .channel(`notes-${view}-${boardId ?? "none"}-${userId}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "notes" }, (payload) => {
-        if (payload.eventType === "DELETE") {
-          const id = (payload.old as { id?: string }).id;
-          if (!id) return;
-          setNotes((prev) => (prev.some((n) => n.id === id) ? prev.filter((n) => n.id !== id) : prev));
-          setActiveId((cur) => (cur === id ? null : cur));
-          setFullId((cur) => (cur === id ? null : cur));
-          setSelectedPhotoId((cur) => (cur === id ? null : cur));
-          setViewerId((cur) => (cur === id ? null : cur));
-          return;
-        }
-        const row = payload.new as Note;
-        if (!row || !matches(row)) return;
-        if (payload.eventType === "INSERT") {
-          setNotes((prev) => (prev.some((n) => n.id === row.id) ? prev : [row, ...prev]));
-          ensureProfile(row.user_id);
-        } else {
-          // the card I am dragging must not jump
-          if (dragState.current?.id === row.id) return;
-          const sigs = sentSigs.current.get(row.id) ?? [];
-          const mine = sigs.indexOf(textSig(row));
-          if (mine !== -1) {
-            sigs.splice(mine, 1); // echo of my own save: consume it
-            sentSigs.current.set(row.id, sigs);
-          }
-          setNotes((prev) => {
-            const i = prev.findIndex((n) => n.id === row.id);
-            if (i === -1) {
-              ensureProfile(row.user_id);
-              return [row, ...prev];
-            }
-            const next = prev.slice();
-            const old = prev[i];
-            // echo of my own change: take only server-side facts, keep what I may be typing right now.
-            // someone else's change (collaborative sticker): take everything.
-            const echo = mine !== -1 || textSig(old) === textSig(row);
-            next[i] = echo
-              ? { ...old, pos_x: row.pos_x, pos_y: row.pos_y, page: row.page, edit_mode: row.edit_mode, updated_at: row.updated_at }
-              : { ...old, ...row };
-            return next;
-          });
-        }
-      })
-      .subscribe();
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [view, boardId, userId, ensureProfile]);
+    const exists = (id: string | null) => !id || allNotes.some((n) => n.id === id);
+    if (!exists(activeId)) setActiveId(null);
+    if (!exists(fullId)) setFullId(null);
+    if (!exists(selectedPhotoId)) setSelectedPhotoId(null);
+    if (!exists(viewerId)) setViewerId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allNotes]);
 
-  const activeNote = notes.find((n) => n.id === activeId) ?? null;
+  // a locked sticker that was opened with its code: the content is merged in memory only
+  const activeNote = useMemo(() => {
+    const n = notes.find((x) => x.id === activeId) ?? null;
+    if (!n || !n.locked) return n;
+    const c = openedContent(n.id);
+    return c ? { ...n, ...c } : null; // closed again -> the editor goes away
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notes, activeId, lockVer]);
+  // the editor closed (any way) -> locked stickers close again
+  useEffect(() => {
+    if (!activeId) relockAll();
+  }, [activeId]);
+  useEffect(() => {
+    if (activeId && notes.some((n) => n.id === activeId && n.locked) && !isOpened(activeId)) setActiveId(null);
+  }, [lockVer, activeId, notes]);
   const fullNote = notes.find((n) => n.id === fullId) ?? null;
   const noBoard = view === "shared" && !boardId;
   const selectedPhoto = notes.find((n) => n.id === selectedPhotoId && n.type === "photo") ?? null;
   const viewerPhotos = visibleNotes
     .filter((n) => n.type === "photo" && n.image_url)
-    .map((n) => ({ id: n.id, url: n.image_url as string, caption: n.caption ?? null }));
+    .map((n) => ({ id: n.id, url: localUrl(n.image_url), caption: n.caption ?? null }));
 
-  const createNote = useCallback(async () => {
+  const noEdit = useCallback(() => {
+    notify("Нет сети: доска открыта только для чтения", "error");
+  }, [notify]);
+
+  const createNote = useCallback(() => {
     if (view === "shared" && !boardId) return;
+    if (readOnly) return noEdit();
     const board = boardRef.current;
     const w = board?.clientWidth ?? window.innerWidth;
     const h = board?.clientHeight ?? window.innerHeight;
     const x = Math.max(20, Math.random() * (w - 240));
     const y = Math.max(128, Math.random() * Math.max(160, h - 220));
     const color: NoteColor = NOTE_COLORS[Math.floor(Math.random() * NOTE_COLORS.length)];
-
-    const { data, error } = await supabase
-      .from("notes")
-      .insert({
-        title: "Новая заметка",
-        body: "",
-        color,
-        pos_x: x,
-        pos_y: y,
-        board: view,
-        page: curPage,
-        ...(view === "shared" ? { board_id: boardId } : {}),
-        font: "default",
-      })
-      .select()
-      .single();
-    if (error) {
-      setError("Не удалось создать заметку");
-      console.error(error);
-      return;
-    }
-    const created = data as Note;
-    setNotes((prev) => (prev.some((n) => n.id === created.id) ? prev : [created, ...prev]));
+    const created = noteCreate({
+      type: "sticker",
+      title: "Новая заметка",
+      body: "",
+      color,
+      pos_x: x,
+      pos_y: y,
+      board: view,
+      board_id: view === "shared" ? boardId : null,
+      page: curPage,
+      font: "default",
+      edit_mode: "author",
+      image_path: null,
+      image_fit: "cover",
+      image_height: 120,
+      image_align: "center",
+      photos: [],
+    });
     setActiveId(created.id);
-  }, [view, boardId, curPage]);
+  }, [view, boardId, curPage, readOnly, noEdit]);
 
   const deleteNote = useCallback(
-    async (id: string) => {
-      const prev = notes.find((n) => n.id === id);
-      // remove legacy image and any multi-photo files
-      const paths: string[] = [];
-      if (prev?.image_path) paths.push(prev.image_path);
-      if (prev?.photos) paths.push(...prev.photos.map((p) => p.path));
-      if (paths.length) removePhotoPaths(paths);
-      setNotes((prevNotes) => prevNotes.filter((n) => n.id !== id));
+    (id: string) => {
+      if (readOnly) return noEdit();
+      noteDelete(id, (path) => imageUrl(path) ?? "");
+      setReminder(id, null);
       setActiveId(null);
-      const { error } = await supabase.from("notes").delete().eq("id", id);
-      if (error) {
-        console.error(error);
-        if (prev) setNotes((p) => [prev, ...p]);
-        setError("Не удалось удалить заметку");
-      }
     },
-    [notes]
+    [readOnly, noEdit]
   );
 
   const updateNote = useCallback(
-    async (id: string, patch: Partial<Pick<Note, "title" | "body" | "color" | "pos_x" | "pos_y" | "font" | "edit_mode" | "image_path" | "image_fit" | "image_height" | "image_align" | "photos" | "page">>) => {
-      const base = notesRef.current.find((n) => n.id === id);
-      if (base) {
-        const list = sentSigs.current.get(id) ?? [];
-        list.push(textSig({ ...base, ...patch }));
-        sentSigs.current.set(id, list.slice(-20));
+    (id: string, patch: Partial<Pick<Note, "title" | "body" | "color" | "pos_x" | "pos_y" | "font" | "edit_mode" | "image_path" | "image_fit" | "image_height" | "image_align" | "photos" | "page">>) => {
+      if (readOnly) return noEdit();
+      if (local.notes.get(id)?.locked) {
+        // locked: the text goes to the server only (never to the local database), the rest as usual
+        const { title, body, photos: _ph, image_path: _ip, ...rest } = patch;
+        void _ph;
+        void _ip;
+        if (Object.keys(rest).length) notePatch(id, rest);
+        if (title !== undefined || body !== undefined) {
+          const c: { title?: string; body?: string } = {};
+          if (title !== undefined) c.title = title;
+          if (body !== undefined) c.body = body;
+          void saveOpened(id, c).then((r) => {
+            if (!r.ok) notify(lockMessage(r), "error");
+          });
+        }
+        return;
       }
-      setNotes((prev) =>
-        prev.map((n) => (n.id === id ? { ...n, ...patch, updated_at: new Date().toISOString() } : n))
-      );
-      const { error } = await supabase
-        .from("notes")
-        .update({ ...patch })
-        .eq("id", id);
-      if (error) {
-        console.error(error);
-        setError("Не удалось сохранить заметку");
-        // access may have been taken away: show what the server really has
-        const { data: fresh } = await supabase.from("notes").select("*").eq("id", id).maybeSingle();
-        if (fresh) setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, ...(fresh as Note) } : n)));
-      }
+      notePatch(id, patch);
     },
-    []
+    [readOnly, noEdit, notify]
   );
 
   // ---- dragging ----
@@ -580,6 +598,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     if (e.button !== 0) return;
     // only the author can drag on public / shared boards; on the private board everything is mine
     if (view !== "private" && !canEdit(note)) return;
+    if (readOnly) return;
     const board = boardRef.current;
     if (!board) return;
     const boardRect = board.getBoundingClientRect();
@@ -588,6 +607,8 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
       offsetX: e.clientX - boardRect.left - note.pos_x,
       offsetY: e.clientY - boardRect.top - note.pos_y,
     };
+    holdIds.add(note.id);
+    dragMoved.current = false;
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
     e.currentTarget.classList.add("dragging");
   };
@@ -600,24 +621,17 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     const boardRect = board.getBoundingClientRect();
     const x = Math.max(0, Math.min(e.clientX - boardRect.left - st.offsetX, boardRect.width - 220));
     const y = Math.max(0, Math.min(e.clientY - boardRect.top - st.offsetY, boardRect.height - 160));
-    setNotes((prev) => prev.map((n) => (n.id === st.id ? { ...n, pos_x: x, pos_y: y } : n)));
+    dragMoved.current = true;
+    noteMoveLive(st.id, x, y);
   };
 
   const onStickyPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     const st = dragState.current;
     if (!st) return;
-    const note = notes.find((n) => n.id === st.id);
     e.currentTarget.classList.remove("dragging");
     dragState.current = null;
-    if (note) {
-      supabase
-        .from("notes")
-        .update({ pos_x: note.pos_x, pos_y: note.pos_y })
-        .eq("id", note.id)
-        .then(({ error }) => {
-          if (error) console.error(error);
-        });
-    }
+    holdIds.delete(st.id);
+    if (dragMoved.current) noteMoveDone(st.id);
   };
 
   // ---- photo objects: same drag code as stickers, plus select / open / edit ----
@@ -629,6 +643,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
         notify("Фото можно добавлять на личную доску и на доски с друзьями", "error");
         return;
       }
+      if (readOnly) return noEdit();
       const problem = validatePhotoFile(file);
       if (problem) {
         notify(problem, "error");
@@ -636,39 +651,36 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
       }
       setUploadingPhoto(true);
       try {
+        // the compressed file is kept on the device; the queue uploads it when the network is there
         const { url, aspect } = await uploadBoardPhoto(file, userId);
         const board = boardRef.current;
         const jitter = () => (Math.random() * 2 - 1) * 48;
         const x = Math.max(20, (board?.scrollLeft ?? 0) + (board?.clientWidth ?? window.innerWidth) / 2 - PHOTO_DEFAULT_W / 2 + jitter());
         const y = Math.max(128, (board?.scrollTop ?? 0) + (board?.clientHeight ?? window.innerHeight) / 2 - 130 + jitter());
-        const { data, error: insertError } = await supabase
-          .from("notes")
-          .insert({
-            type: "photo",
-            title: "",
-            body: "",
-            color: "yellow",
-            pos_x: x,
-            pos_y: y,
-            board: view,
-            page: curPage,
-            ...(view === "shared" ? { board_id: boardId } : {}),
-            font: "default",
-            image_url: url,
-            width: PHOTO_DEFAULT_W,
-            aspect,
-            caption: null,
-          })
-          .select()
-          .single();
-        if (insertError) {
-          removeBoardPhoto(url);
-          throw insertError;
-        }
-        const created = data as Note;
-        setNotes((prev) => (prev.some((n) => n.id === created.id) ? prev : [created, ...prev]));
+        const created = noteCreate({
+          type: "photo",
+          title: "",
+          body: "",
+          color: "yellow",
+          pos_x: x,
+          pos_y: y,
+          board: view,
+          board_id: view === "shared" ? boardId : null,
+          page: curPage,
+          font: "default",
+          edit_mode: "author",
+          image_path: null,
+          image_fit: "cover",
+          image_height: 120,
+          image_align: "center",
+          photos: [],
+          image_url: url,
+          width: PHOTO_DEFAULT_W,
+          aspect,
+          caption: null,
+        });
         if (!isGridLayout()) setSelectedPhotoId(created.id);
-        notify("Фото добавлено");
+        notify(online ? "Фото добавлено" : "Фото сохранено на устройстве и загрузится при появлении сети");
       } catch (e) {
         console.error("Стикеры: не удалось добавить фото", e);
         notify(photoErrorText(e, "Не удалось добавить фото. Попробуйте ещё раз"), "error");
@@ -676,7 +688,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
         setUploadingPhoto(false);
       }
     },
-    [view, boardId, userId, notify, curPage]
+    [view, boardId, userId, notify, curPage, readOnly, noEdit, online]
   );
 
   const addPhotos = useCallback(
@@ -687,6 +699,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   );
 
   const replacePhoto = async (file: File, note: Note) => {
+    if (readOnly) return noEdit();
     const problem = validatePhotoFile(file);
     if (problem) {
       notify(problem, "error");
@@ -696,13 +709,8 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     try {
       const old = note.image_url;
       const { url, aspect } = await uploadBoardPhoto(file, userId);
-      const { error: updateError } = await supabase.from("notes").update({ image_url: url, aspect }).eq("id", note.id);
-      if (updateError) {
-        removeBoardPhoto(url);
-        throw updateError;
-      }
-      setNotes((prev) => prev.map((n) => (n.id === note.id ? { ...n, image_url: url, aspect } : n)));
-      if (old) removeBoardPhoto(old);
+      notePatch(note.id, { image_url: url, aspect });
+      if (old) window.setTimeout(() => void removeBoardPhoto(old), 15000); // after the change reached the server
       notify("Фото заменено");
     } catch (e) {
       console.error("Стикеры: не удалось заменить фото", e);
@@ -712,53 +720,37 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
     }
   };
 
-  // live size change (slider, presets, corner handle); saved 400 ms after the last change
+  // live size change (slider, presets, corner handle); queued 400 ms after the last change
   const setPhotoWidth = useCallback(
     (id: string, raw: number) => {
+      if (readOnly) return;
       const width = Math.round(Math.max(PHOTO_MIN_W, Math.min(PHOTO_MAX_W, raw)));
-      setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, width } : n)));
+      const row = local.notes.get(id);
+      if (row) local.notes.put({ ...row, width }, false);
       window.clearTimeout(widthTimers.current[id]);
-      widthTimers.current[id] = window.setTimeout(async () => {
-        const { error: saveError } = await supabase.from("notes").update({ width }).eq("id", id);
-        if (saveError) {
-          console.error(saveError);
-          notify("Не удалось сохранить размер фото", "error");
-        }
-      }, 400);
+      widthTimers.current[id] = window.setTimeout(() => notePatch(id, { width }), 400);
     },
-    [notify]
+    [readOnly]
   );
 
   const setPhotoCaption = useCallback(
-    async (id: string, caption: string | null) => {
-      setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, caption } : n)));
-      const { error: saveError } = await supabase.from("notes").update({ caption }).eq("id", id);
-      if (saveError) {
-        console.error(saveError);
-        notify("Не удалось сохранить подпись", "error");
-      } else {
-        notify("Подпись сохранена");
-      }
+    (id: string, caption: string | null) => {
+      if (readOnly) return noEdit();
+      notePatch(id, { caption });
+      notify("Подпись сохранена");
     },
-    [notify]
+    [notify, readOnly, noEdit]
   );
 
   const deletePhoto = useCallback(
-    async (note: Note) => {
+    (note: Note) => {
+      if (readOnly) return noEdit();
       setConfirmPhotoId(null);
       setSelectedPhotoId(null);
-      setNotes((prev) => prev.filter((n) => n.id !== note.id));
-      const { error: deleteError } = await supabase.from("notes").delete().eq("id", note.id);
-      if (deleteError) {
-        console.error(deleteError);
-        setNotes((prev) => [note, ...prev]);
-        notify("Не удалось удалить фото", "error");
-        return;
-      }
-      if (note.image_url) removeBoardPhoto(note.image_url);
+      noteDelete(note.id);
       notify("Фото удалено");
     },
-    [notify]
+    [notify, readOnly, noEdit]
   );
 
   const clearPress = () => {
@@ -803,6 +795,12 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
 
   const openNote = (id: string) => {
     if (threadMode) return;
+    const n = notes.find((x) => x.id === id);
+    if (n?.locked && !isOpened(id)) {
+      if (n.user_id !== userId) return notify("Стикер заблокирован автором", "error");
+      if (!online) return notify("Нужна сеть: код проверяется на сервере", "error");
+      return setLockDlg({ kind: "open", id });
+    }
     setActiveId(id);
   };
   const threadedIds = useMemo(() => {
@@ -860,11 +858,13 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
   }, [activeId, friendsOpen, profileOpen, viewerId, newBoardOpen, manageOpen, fullId, bgOpen, drawMode, addPhotos]);
 
   const canDelete = (note: Note) =>
-    note.user_id === userId ||
-    (view === "shared" ? isBoardOwner : me?.is_admin === true);
+    !readOnly &&
+    (note.user_id === userId ||
+      (view === "shared" ? isBoardOwner : me?.is_admin === true));
   const canEdit = (note: Note) =>
-    note.user_id === userId ||
-    (view === "shared" && note.edit_mode === "members" && note.type !== "photo");
+    !readOnly &&
+    (note.user_id === userId ||
+      (view === "shared" && note.edit_mode === "members" && note.type !== "photo"));
   // the author closed access while I had the sticker open -> read-only + toast
   const openNoteForRights = activeNote ?? fullNote;
   const openCan = openNoteForRights ? canEdit(openNoteForRights) : false;
@@ -930,13 +930,13 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
             Доски
           </button>
         </div>
-        <button className="tool-btn primary" onClick={createNote} disabled={loading || noBoard}>
+        <button className="tool-btn primary" onClick={createNote} disabled={loading || noBoard || readOnly}>
           + Новый стикер
         </button>
         <button
           className="tool-btn photo-btn"
           onClick={() => addInputRef.current?.click()}
-          disabled={loading || uploadingPhoto || noBoard}
+          disabled={loading || uploadingPhoto || noBoard || readOnly}
           title="Добавить фото"
           aria-label="Добавить фото"
         >
@@ -977,6 +977,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           <span className="photo-btn-label">Фон</span>
         </button>
         <span className="count">{visibleNotes.length} шт.</span>
+        <SyncBadge />
         {me?.is_admin && <span className="admin-badge">Админ</span>}
         <button
           className="friends-btn"
@@ -1006,11 +1007,12 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           boards={boardsApi.boards}
           activeId={view === "shared" ? boardId : null}
           onPick={pickBoard}
-          onNew={() => setNewBoardOpen(true)}
+          onNew={() => openNewBoard(friendsApi.friends.length > 0 ? "friends" : "solo")}
           onManage={() => setManageOpen(true)}
         />
       )}
 
+      {readOnly && <OfflineBanner />}
       <BoardBackground bg={background.bg} photoUrl={background.photoUrl} />
       <div
         className={`board${view !== "private" ? " has-chips" : ""}${background.bg.kind !== "none" ? " custom-bg" : ""}`}
@@ -1062,10 +1064,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
         {!loading && visibleNotes.length === 0 && (
           <div className="empty-hint">
             {noBoard ? (
-              <>
-                <div className="big">{boardsApi.boards.length === 0 ? "У вас пока нет досок с друзьями" : "Выберите доску"}</div>
-                {boardsApi.boards.length === 0 && <div>Нажмите «+ Новая доска» и пригласите друзей</div>}
-              </>
+              <BoardOffer hasBoards={boardsApi.boards.length > 0} online={online} onCreate={openNewBoard} />
             ) : (
               <>
                 <div className="big">{pagesApi.pages.length > 1 ? "Страница пустая" : view === "private" ? "Личная доска пустая" : `Доска «${activeBoard?.name ?? ""}» пустая`}</div>
@@ -1108,7 +1107,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
                   onPointerUp={threadMode ? (e) => e.stopPropagation() : undefined}
                   onClick={threadMode ? (e) => { e.stopPropagation(); onPinTap(note.id); } : undefined}
                 />
-                  <PhotoFrame url={note.image_url} aspect={note.aspect ?? 1} caption={note.caption} />
+                  <PhotoFrame url={localUrl(note.image_url)} aspect={note.aspect ?? 1} caption={note.caption} />
                   {view === "shared" && note.user_id && profiles[note.user_id] && (
                     <div className="pc-author">— {profiles[note.user_id].username}</div>
                   )}
@@ -1121,11 +1120,12 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           const photos = note.photos && note.photos.length > 0
             ? note.photos
             : defaultPhotosFromLegacy(note.image_path, imageUrl(note.image_path));
-          const thumb = photos[0] ?? null;
+          const locked = !!note.locked;
+          const thumb = locked ? null : photos[0] ?? null;
           return (
             <div
               key={note.id}
-              className="sticky"
+              className={`sticky${locked ? " locked" : ""}`}
               style={{
                 ["--note-x" as string]: `${note.pos_x}px`,
                 ["--note-y" as string]: `${note.pos_y}px`,
@@ -1147,6 +1147,12 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
                   onPointerUp={threadMode ? (e) => e.stopPropagation() : undefined}
                   onClick={threadMode ? (e) => { e.stopPropagation(); onPinTap(note.id); } : undefined}
                 />
+              {reminders[note.id] && (
+                <span className="sticky-bell" title={`Напоминание: ${new Date(reminders[note.id]).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}`}>
+                  <BellIcon size={14} />
+                </span>
+              )}
+              {!locked && (
               <button
                 type="button"
                 className="sticky-expand"
@@ -1163,6 +1169,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
                   <path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7" />
                 </svg>
               </button>
+              )}
               {thumb && (
                 <div className="sticky-photo-wrap">
                   <div
@@ -1175,7 +1182,7 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
                   >
                     <div className="photo-skeleton" />
                     <img
-                      src={thumb.url}
+                      src={localUrl(thumb.url)}
                       alt=""
                       loading="lazy"
                       decoding="async"
@@ -1201,8 +1208,17 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
                   </svg>
                 </div>
               )}
-              <h3 className="sticky-title">{note.title || "Без названия"}</h3>
-              {preview(note.body) && <p className="sticky-preview">{preview(note.body)}</p>}
+              {locked ? (
+                <div className="sticky-lock" aria-label="Стикер заблокирован">
+                  <LockIcon size={30} />
+                  <span className="sticky-lock-bars" aria-hidden="true"><i /><i /><i /></span>
+                </div>
+              ) : (
+                <>
+                  <h3 className="sticky-title">{note.title || "Без названия"}</h3>
+                  {preview(note.body) && <p className="sticky-preview">{preview(note.body)}</p>}
+                </>
+              )}
               <div className="sticky-foot">
                 <span className="sticky-time">{formatTime(note.created_at)}</span>
                 {view !== "private" && author && (
@@ -1232,8 +1248,12 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
       {activeNote && (
         <NoteEditor
           note={activeNote}
-          canEdit={canEdit(activeNote)}
+          canEdit={canEdit(activeNote) && (!activeNote.locked || online)}
           isAuthor={activeNote.user_id === userId}
+          onLockAction={(k) => setLockDlg({ kind: k, id: activeNote.id })}
+          reminderAt={reminders[activeNote.id] ?? null}
+          onRemind={() => setRemindFor(activeNote.id)}
+          lockOnline={online}
           showAccess={view === "shared" && activeNote.user_id === userId && activeNote.type !== "photo"}
           editMode={activeNote.edit_mode ?? "author"}
           onEditMode={(m) => updateNote(activeNote.id, { edit_mode: m })}
@@ -1391,11 +1411,44 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
       {!noBoard && !activeNote && !friendsOpen && !profileOpen && !newBoardOpen && !manageOpen && !fullId && !bgOpen && !drawMode && !threadMode && !viewerId && !selectedPhoto && (
         <PageBar api={pagesApi} onMenu={() => setPageMenuOpen(true)} notify={notify} />
       )}
-      {pageMenuOpen && <PageMenu api={pagesApi} counts={pageCounts} onClose={() => setPageMenuOpen(false)} notify={notify} />}
+      {pageMenuOpen && (
+        <PageMenu
+          api={pagesApi}
+          counts={pageCounts}
+          onClose={() => setPageMenuOpen(false)}
+          onExport={() => {
+            setPageMenuOpen(false);
+            setExportOpen(true);
+          }}
+          notify={notify}
+        />
+      )}
+      {exportOpen && (
+        <ExportSheet
+          notify={notify}
+          onClose={() => setExportOpen(false)}
+          build={(): ExportInput => ({
+            title: view === "shared" ? activeBoard?.name ?? "Доска" : "Личная доска",
+            kind: view === "shared" ? "shared" : "private",
+            style: (document.documentElement.getAttribute("data-style") as ExportInput["style"]) || "modern",
+            pages: pagesApi.pages.map((p) => ({ page: p.page, name: p.name })),
+            curPage,
+            // locked stickers are exported closed: their content is not here (only an opened one is, in memory)
+            notes,
+            conns: threads.items,
+            strokesOf: (pg) => local.drawings.get(drawKey(userId, pg))?.strokes ?? [],
+            authors: Object.fromEntries(Object.values(profiles).map((p) => [p.id, p.username])),
+            bg: background.bg,
+            bgPhotoUrl: background.photoUrl,
+            imageUrl,
+          })}
+        />
+      )}
       {view === "private" && <DrawingLayer api={drawings} editing={drawMode} onDone={() => setDrawMode(false)} notify={notify} />}
       {bgOpen && <BackgroundDialog api={background} onClose={() => setBgOpen(false)} notify={notify} />}
       {newBoardOpen && (
         <NewBoardDialog
+          initialMode={newBoardMode}
           friends={friendsApi}
           boards={boardsApi}
           notify={notify}
@@ -1435,6 +1488,25 @@ function BoardApp({ theme, onToggleTheme, view, setView, boardId, setBoardId, us
           notify={notify}
         />
       )}
+      {remindFor && <ReminderDialog noteId={remindFor} current={reminders[remindFor] ?? null} notify={notify} onClose={() => setRemindFor(null)} />}
+      {lockDlg && (
+        <LockDialog
+          kind={lockDlg.kind}
+          noteId={lockDlg.id}
+          onClose={() => setLockDlg(null)}
+          onDone={(k) => {
+            const id = lockDlg.id;
+            setLockDlg(null);
+            if (k === "open") setActiveId(id);
+            else if (k === "set") notify("Стикер заблокирован");
+            else if (k === "change") notify("Код изменён");
+            else {
+              relock(id);
+              notify("Блокировка снята");
+            }
+          }}
+        />
+      )}
       <ToastView toast={toast} onClose={() => setToast(null)} />
     </>
   );
@@ -1459,9 +1531,14 @@ interface NoteEditorProps {
   onDelete: () => void;
   pages: PageInfo[];
   onMovePage: (page: number) => void;
+  onLockAction: (k: LockDialogKind) => void;
+  lockOnline: boolean;
+  reminderAt: string | null;
+  onRemind: () => void;
 }
 
-function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode, canDelete, onClose, onChange, onDelete, pages, onMovePage }: NoteEditorProps) {
+function NoteEditor({ note, canEdit, isAuthor, onLockAction, lockOnline, reminderAt, onRemind, showAccess, editMode, onEditMode, canDelete, onClose, onChange, onDelete, pages, onMovePage }: NoteEditorProps) {
+  const photoEditable = canEdit && isAuthor && !note.locked; // photos of a locked sticker change only after the lock is removed
   const [title, setTitle] = useState(note.title);
   const [body, setBody] = useState(note.body);
   const [color, setColor] = useState<NoteColor>(note.color);
@@ -1529,7 +1606,7 @@ function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode,
     return () => clearTimeout(t);
   }, [showSaved]);
 
-  // debounced save (600ms)
+  // debounced save (300 ms; the change goes to the local database first)
   useEffect(() => {
     const initialExisting =
       note.photos && note.photos.length > 0
@@ -1546,22 +1623,36 @@ function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode,
     )
       return;
     setSaveStatus("saving");
+    const payload = isAuthor ? { title, body, color, font, photos: photo ? [photo] : [] } : { title, body, color, font };
+    unsaved.current = payload;
     const t = setTimeout(() => {
-      onChange(isAuthor ? { title, body, color, font, photos: photo ? [photo] : [] } : { title, body, color, font });
+      unsaved.current = null;
+      onChange(payload);
       setSaveStatus("saved");
       setShowSaved(true);
-    }, 600);
+    }, 300);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [title, body, color, font, photo]);
 
+  // closing the editor right after typing must not lose the last characters
+  const unsaved = useRef<Parameters<typeof onChange>[0] | null>(null);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  useEffect(
+    () => () => {
+      if (unsaved.current) onChangeRef.current(unsaved.current);
+    },
+    []
+  );
+
   const replacePhoto = async (file: File) => {
-    if (!canEdit || !isAuthor || !photo) return;
+    if (!photoEditable || !photo) return;
     setUploading(true);
     setEditorError(null);
     try {
       const newPhoto = await uploadPhoto(file, note.user_id ?? "anon", note.id);
-      removePhotoPaths([photo.path]);
+      removeStickerPhoto(photo);
       setPhoto({ ...newPhoto, x: photo.x, y: photo.y, width: photo.width });
     } catch (e) {
       console.error(e);
@@ -1577,7 +1668,7 @@ function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode,
 
   const deletePhoto = useCallback(() => {
     setPhoto((prev) => {
-      if (prev) removePhotoPaths([prev.path]);
+      if (prev) removeStickerPhoto(prev);
       return null;
     });
     setPhotoSelected(false);
@@ -1613,13 +1704,13 @@ function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode,
               <PhotoLayer
                 photo={photo}
                 selected={photoSelected}
-                canEdit={canEdit && isAuthor}
+                canEdit={photoEditable}
                 onSelect={() => setPhotoSelected(true)}
                 onDeselect={() => setPhotoSelected(false)}
                 onChange={updatePhoto}
                 onDelete={deletePhoto}
                 onReplace={() => fileInputRef.current?.click()}
-                onFullscreen={() => setFullscreenPhoto(photo.url)}
+                onFullscreen={() => setFullscreenPhoto(localUrl(photo.url))}
               />
             )}
             {uploading && <div className="photo-progress">Обработка фото…</div>}
@@ -1681,7 +1772,7 @@ function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode,
             </div>
           )}
 
-          {photo && photoSelected && canEdit && isAuthor && (
+          {photo && photoSelected && photoEditable && (
             <div className="photo-size-controls">
               <span className="size-label">Размер</span>
               {([["small", 40, "Мал"], ["medium", 70, "Сред"], ["large", 95, "Большое"]] as const).map(([key, value, label]) => (
@@ -1709,7 +1800,7 @@ function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode,
         <div className="paper-foot">
           <div className="paper-actions">
             {canEdit && isAuthor && <MoveToPage pages={pages} current={note.page ?? 1} onMove={onMovePage} />}
-            {canEdit && isAuthor && photo && (
+            {photoEditable && photo && (
               <input
                 type="file"
                 accept="image/*"
@@ -1721,6 +1812,27 @@ function NoteEditor({ note, canEdit, isAuthor, showAccess, editMode, onEditMode,
                   e.target.value = "";
                 }}
               />
+            )}
+            <button type="button" className="btn-photo remind-btn" onClick={onRemind}>
+              <BellIcon /> {reminderAt ? `Напомню ${new Date(reminderAt).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}` : "Напомнить"}
+            </button>
+            {isAuthor && note.type !== "photo" && (
+              <span className="lock-actions">
+                {!note.locked ? (
+                  <button type="button" className="btn-photo" disabled={!lockOnline} title={lockOnline ? "Закрыть стикер кодом" : "Нужна сеть"} onClick={() => onLockAction("set")}>
+                    <LockIcon size={15} /> Заблокировать
+                  </button>
+                ) : (
+                  <>
+                    <button type="button" className="btn-photo" disabled={!lockOnline} onClick={() => onLockAction("change")}>
+                      <LockIcon size={15} /> Сменить код
+                    </button>
+                    <button type="button" className="btn-photo" disabled={!lockOnline} onClick={() => onLockAction("remove")}>
+                      Снять блокировку
+                    </button>
+                  </>
+                )}
+              </span>
             )}
             {canDelete && (
               confirmDelete ? (

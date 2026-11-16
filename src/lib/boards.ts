@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useMemo } from "react";
 import { supabase } from "./supabase";
+import { local, useTable } from "./localdb";
+import { useOnline, isOnline, refreshBoards } from "./sync";
 import type { BoardInfo, BoardMember } from "./supabase";
 
 export function boardsErrorText(error: unknown): string {
@@ -17,87 +19,55 @@ export function boardsErrorText(error: unknown): string {
 
 type Names = Record<string, string>;
 
+const NO_NET = "Нет сети. Доски с друзьями можно менять только онлайн";
+
 /**
- * Shared boards I belong to + their members. Kept fresh with Realtime
- * (boards / board_members) and re-read on window focus as a safety net.
+ * Shared boards I belong to + their members, from the local database (the last known state is shown
+ * without a network). Creating and changing boards needs the network: those actions are not queued.
  */
 export function useBoards(userId: string) {
-  const [boards, setBoards] = useState<BoardInfo[]>([]);
-  const [members, setMembers] = useState<BoardMember[]>([]);
-  const [names, setNames] = useState<Names>({});
-  const [loading, setLoading] = useState(true);
-  const alive = useRef(true);
-  const namesRef = useRef<Names>({});
-  namesRef.current = names;
+  void userId;
+  const boardRows = useTable(local.boards);
+  const memberRows = useTable(local.members);
+  const profileRows = useTable(local.profiles);
+  const metaRows = useTable(local.meta);
+  const online = useOnline();
+  const boards = useMemo(() => boardRows.slice().sort((a, b) => (a.created_at > b.created_at ? 1 : -1)), [boardRows]);
+  const members = useMemo<BoardMember[]>(() => memberRows.map((m) => ({ board_id: m.board_id, user_id: m.user_id })), [memberRows]);
+  const names = useMemo<Names>(() => Object.fromEntries(profileRows.map((p) => [p.id, p.username])), [profileRows]);
+  // the list is "loading" only until the first successful synchronisation on this device
+  const loading = !metaRows.some((m) => m.key === "lastSync") && online;
 
   const reload = useCallback(async () => {
-    try {
-      const [b, m] = await Promise.all([
-        supabase.from("boards").select("id, owner_id, name, created_at").order("created_at", { ascending: true }),
-        supabase.from("board_members").select("board_id, user_id"),
-      ]);
-      if (b.error) throw b.error;
-      if (m.error) throw m.error;
-      const memberRows = (m.data ?? []) as BoardMember[];
-      const boardRows = (b.data ?? []) as BoardInfo[];
-      const missing = Array.from(new Set(memberRows.map((r) => r.user_id))).filter((id) => !namesRef.current[id]);
-      const added: Names = {};
-      if (missing.length) {
-        const { data } = await supabase.from("profiles").select("id, username").in("id", missing);
-        for (const p of (data ?? []) as { id: string; username: string }[]) added[p.id] = p.username;
-      }
-      if (!alive.current) return;
-      setBoards(boardRows);
-      setMembers(memberRows);
-      if (Object.keys(added).length) setNames((prev) => ({ ...prev, ...added }));
-    } catch (e) {
-      console.error("Стикеры: не удалось загрузить доски", e);
-    } finally {
-      if (alive.current) setLoading(false);
-    }
+    await refreshBoards();
   }, []);
-
-  useEffect(() => {
-    alive.current = true;
-    reload();
-    const onFocus = () => reload();
-    window.addEventListener("focus", onFocus);
-    const channel = supabase
-      .channel(`boards-${userId}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "boards" }, () => reload())
-      .on("postgres_changes", { event: "*", schema: "public", table: "board_members" }, () => reload())
-      .subscribe();
-    return () => {
-      alive.current = false;
-      window.removeEventListener("focus", onFocus);
-      supabase.removeChannel(channel);
-    };
-  }, [reload, userId]);
 
   const create = useCallback(
     async (name: string, friendIds: string[]): Promise<{ id?: string; error: string | null }> => {
+      if (!isOnline()) return { error: NO_NET };
       const { data, error } = await supabase.rpc("create_board", { p_name: name, p_friends: friendIds });
       if (error) {
         console.error(error);
         return { error: boardsErrorText(error) };
       }
-      await reload();
+      await refreshBoards();
       return { id: data as string, error: null };
     },
-    [reload]
+    []
   );
 
   const act = useCallback(
     async (fn: () => PromiseLike<{ error: unknown }>): Promise<string | null> => {
+      if (!isOnline()) return NO_NET;
       const { error } = await fn();
       if (error) {
         console.error(error);
         return boardsErrorText(error);
       }
-      await reload();
+      await refreshBoards();
       return null;
     },
-    [reload]
+    []
   );
 
   const rename = useCallback(

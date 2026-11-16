@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { supabase } from "./supabase";
+import { useCallback, useMemo } from "react";
+import { local, useTable } from "./localdb";
+import { useOnline } from "./sync";
+import { connCreate, connPatch, connDelete } from "./data";
 import type { Board } from "./supabase";
 
 export interface Connection {
@@ -31,64 +33,20 @@ export function threadErrorText(error: unknown): string {
 
 const pairKey = (a: string, b: string) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 
-/** Threads of the current board (private or one shared board), kept live with Realtime. */
+export const NO_NET_TEXT = "Нет сети: доска открыта только для чтения";
+
+/** Threads of the current board (private or one shared board): read from and written to the local database. */
 export function useConnections(view: Board, boardId: string | null, userId: string) {
   const enabled = view === "private" || (view === "shared" && !!boardId);
-  const [items, setItems] = useState<Connection[]>([]);
-  const alive = useRef(true);
+  const all = useTable(local.connections);
+  const online = useOnline();
+  const readOnly = view === "shared" && !online;
+  void userId;
 
-  const matches = useCallback(
-    (c: Partial<Connection>) => (view === "shared" ? c.board === "shared" && c.board_id === boardId : c.board === "private"),
-    [view, boardId]
-  );
-
-  const load = useCallback(async () => {
-    if (!enabled) {
-      setItems([]);
-      return;
-    }
-    let q = supabase.from("connections").select("*");
-    q = view === "shared" ? q.eq("board_id", boardId as string) : q.eq("board", "private");
-    const { data, error } = await q;
-    if (error) {
-      console.error("Стикеры: не удалось загрузить нити", error);
-      return;
-    }
-    if (alive.current) setItems((data ?? []) as Connection[]);
-  }, [enabled, view, boardId]);
-
-  useEffect(() => {
-    alive.current = true;
-    setItems([]);
-    load();
-    if (!enabled) return () => void (alive.current = false);
-    const onFocus = () => load();
-    window.addEventListener("focus", onFocus);
-    const channel = supabase
-      .channel(`threads-${view}-${boardId ?? "own"}-${userId}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "connections" }, (payload) => {
-        if (payload.eventType === "DELETE") {
-          const id = (payload.old as { id?: string }).id;
-          if (id) setItems((prev) => (prev.some((c) => c.id === id) ? prev.filter((c) => c.id !== id) : prev));
-          return;
-        }
-        const row = payload.new as Connection;
-        if (!row || !matches(row)) return;
-        setItems((prev) => {
-          const i = prev.findIndex((c) => c.id === row.id);
-          if (i === -1) return [...prev, row];
-          const next = prev.slice();
-          next[i] = { ...prev[i], ...row };
-          return next;
-        });
-      })
-      .subscribe();
-    return () => {
-      alive.current = false;
-      window.removeEventListener("focus", onFocus);
-      supabase.removeChannel(channel);
-    };
-  }, [enabled, view, boardId, userId, load, matches]);
+  const items = useMemo(
+    () => (enabled ? all.filter((c) => (view === "shared" ? c.board === "shared" && c.board_id === boardId : c.board === "private")) : []),
+    [all, enabled, view, boardId]
+  ) as Connection[];
 
   const find = useCallback((a: string, b: string) => items.find((c) => pairKey(c.a_id, c.b_id) === pairKey(a, b)) ?? null, [items]);
 
@@ -97,44 +55,46 @@ export function useConnections(view: Board, boardId: string | null, userId: stri
     async (x: string, y: string): Promise<{ conn: Connection | null; existed: boolean; error: string | null }> => {
       const old = find(x, y);
       if (old) return { conn: old, existed: true, error: null };
+      if (readOnly) return { conn: null, existed: false, error: NO_NET_TEXT };
+      const na = local.notes.get(x);
+      const nb = local.notes.get(y);
+      if (!na || !nb) return { conn: null, existed: false, error: threadErrorText(null) };
+      if ((na.page ?? 1) !== (nb.page ?? 1)) return { conn: null, existed: false, error: threadErrorText({ message: "DIFFERENT_PAGES" }) };
+      if (na.board !== nb.board || (na.board_id ?? null) !== (nb.board_id ?? null)) return { conn: null, existed: false, error: threadErrorText({ message: "DIFFERENT_BOARDS" }) };
       const [a, b] = x < y ? [x, y] : [y, x];
-      const { data, error } = await supabase.from("connections").insert({ a_id: a, b_id: b }).select().single();
-      if (error || !data) {
-        console.error(error);
-        if (error && String((error as { message?: string }).message).includes("duplicate key")) {
-          await load();
-          return { conn: null, existed: true, error: null };
-        }
-        return { conn: null, existed: false, error: threadErrorText(error) };
-      }
-      const row = data as Connection;
-      setItems((prev) => (prev.some((c) => c.id === row.id) ? prev : [...prev, row]));
-      return { conn: row, existed: false, error: null };
+      const row = connCreate({
+        a_id: a,
+        b_id: b,
+        board: na.board === "shared" ? "shared" : "private",
+        board_id: na.board_id ?? null,
+        page: na.page ?? 1,
+      });
+      return { conn: row as Connection, existed: false, error: null };
     },
-    [find, load]
+    [find, readOnly]
   );
 
-  const update = useCallback(async (id: string, patch: Partial<Pick<Connection, "color" | "dashed" | "label">>) => {
-    setItems((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
-    const { error } = await supabase.from("connections").update(patch).eq("id", id);
-    if (error) {
-      console.error(error);
-      return threadErrorText(error);
-    }
-    return null;
-  }, []);
+  const update = useCallback(
+    async (id: string, patch: Partial<Pick<Connection, "color" | "dashed" | "label">>) => {
+      if (readOnly) return NO_NET_TEXT;
+      connPatch(id, patch);
+      return null;
+    },
+    [readOnly]
+  );
 
-  const remove = useCallback(async (id: string) => {
-    const { error } = await supabase.from("connections").delete().eq("id", id);
-    if (error) {
-      console.error(error);
-      return threadErrorText(error);
-    }
-    setItems((prev) => prev.filter((c) => c.id !== id));
-    return null;
-  }, []);
+  const remove = useCallback(
+    async (id: string) => {
+      if (readOnly) return NO_NET_TEXT;
+      connDelete(id);
+      return null;
+    },
+    [readOnly]
+  );
 
-  return { items, create, update, remove, find, reload: load };
+  const reload = useCallback(async () => undefined, []);
+
+  return { items, create, update, remove, find, reload };
 }
 
 export type ThreadsApi = ReturnType<typeof useConnections>;

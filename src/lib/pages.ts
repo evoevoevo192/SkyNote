@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { supabase } from "./supabase";
+import { useCallback, useMemo, useState } from "react";
+import { local, useTable } from "./localdb";
+import { useOnline } from "./sync";
+import { pageInsert, pageRename, pageDelete } from "./data";
 import type { Board } from "./supabase";
 
 export const MAX_PAGES = 10;
@@ -24,69 +26,25 @@ export function pagesErrorText(error: unknown): string {
   return "Не удалось выполнить действие со страницей";
 }
 
+const NOT_EMPTY = "Страница не пустая: сначала уберите стикеры, нити и рисунок";
+const NO_NET = "Нет сети: доска открыта только для чтения";
+
 /**
- * Pages of the current board (personal, or one shared board).
+ * Pages of the current board (personal, or one shared board), kept in the local database.
  * A page exists if it has a row in board_pages or if any object lives on it; with nothing at all there is page 1.
  */
 export function useBoardPages(view: Board, boardId: string | null, userId: string, objectPages: number[]) {
   const enabled = view === "private" || (view === "shared" && !!boardId);
   const key = view === "shared" ? (boardId ?? "none") : "private";
-  const [rows, setRows] = useState<PageRow[]>([]);
+  const all = useTable(local.pages);
+  const online = useOnline();
+  const readOnly = view === "shared" && !online;
   const [current, setCurrent] = useState<Record<string, number>>({});
-  const alive = useRef(true);
 
-  const isMine = useCallback(
-    (r: Partial<PageRow>) => (view === "shared" ? r.board_id === boardId : !r.board_id && r.user_id === userId),
-    [view, boardId, userId]
-  );
-
-  const load = useCallback(async () => {
-    if (!enabled) {
-      setRows([]);
-      return;
-    }
-    let q = supabase.from("board_pages").select("id, user_id, board_id, page, name");
-    q = view === "shared" ? q.eq("board_id", boardId as string) : q.is("board_id", null).eq("user_id", userId);
-    const { data, error } = await q;
-    if (error) {
-      console.error("Стикеры: не удалось загрузить страницы", error);
-      return;
-    }
-    if (alive.current) setRows((data ?? []) as PageRow[]);
-  }, [enabled, view, boardId, userId]);
-
-  useEffect(() => {
-    alive.current = true;
-    setRows([]);
-    load();
-    if (!enabled) return () => void (alive.current = false);
-    const onFocus = () => load();
-    window.addEventListener("focus", onFocus);
-    const channel = supabase
-      .channel(`pages-${key}-${userId}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "board_pages" }, (payload) => {
-        if (payload.eventType === "DELETE") {
-          const id = (payload.old as { id?: string }).id;
-          if (id) setRows((prev) => (prev.some((r) => r.id === id) ? prev.filter((r) => r.id !== id) : prev));
-          return;
-        }
-        const row = payload.new as PageRow;
-        if (!row || !isMine(row)) return;
-        setRows((prev) => {
-          const i = prev.findIndex((r) => r.id === row.id);
-          if (i === -1) return prev.some((r) => r.page === row.page) ? prev.map((r) => (r.page === row.page ? row : r)) : [...prev, row];
-          const next = prev.slice();
-          next[i] = { ...prev[i], ...row };
-          return next;
-        });
-      })
-      .subscribe();
-    return () => {
-      alive.current = false;
-      window.removeEventListener("focus", onFocus);
-      supabase.removeChannel(channel);
-    };
-  }, [enabled, key, userId, load, isMine]);
+  const rows = useMemo(
+    () => (enabled ? all.filter((r) => (view === "shared" ? r.board_id === boardId : !r.board_id && r.user_id === userId)) : []),
+    [all, enabled, view, boardId, userId]
+  ) as PageRow[];
 
   const objectKey = objectPages.join(",");
   const pages: PageInfo[] = useMemo(() => {
@@ -115,87 +73,66 @@ export function useBoardPages(view: Board, boardId: string | null, userId: strin
     [pages, page, setPage]
   );
 
-  const scope = useCallback(
-    (p: number) => (view === "shared" ? { board_id: boardId as string, page: p } : { user_id: userId, page: p }),
+  const scope = useMemo(
+    () => (view === "shared" ? { user_id: null, board_id: boardId as string } : { user_id: userId, board_id: null }),
     [view, boardId, userId]
   );
 
   /** Make sure every page that exists only "virtually" (page 1, or via objects) also has a row. */
   const ensureRows = useCallback(
-    async (list: number[]) => {
-      for (const p of list) {
-        if (rows.some((r) => r.page === p)) continue;
-        const { data, error } = await supabase.from("board_pages").insert({ ...scope(p), name: "" }).select("id, user_id, board_id, page, name").single();
-        if (error) {
-          if (!String(error.message).includes("duplicate key")) throw error;
-        } else if (data && alive.current) {
-          setRows((prev) => (prev.some((r) => r.page === p) ? prev : [...prev, data as PageRow]));
-        }
-      }
+    (list: number[]) => {
+      for (const p of list) if (!rows.some((r) => r.page === p)) pageInsert(scope, p, "");
     },
     [rows, scope]
   );
 
   const add = useCallback(async (): Promise<string | null> => {
     if (!enabled) return null;
+    if (readOnly) return NO_NET;
     if (pages.length >= MAX_PAGES) return `Можно создать не больше ${MAX_PAGES} страниц`;
     const used = new Set(pages.map((p) => p.page));
     const max = Math.max(...used);
     let n = max < MAX_PAGES ? max + 1 : 0;
     if (!n) for (let i = 1; i <= MAX_PAGES; i++) if (!used.has(i)) { n = i; break; }
-    try {
-      await ensureRows(pages.map((p) => p.page));
-      const { data, error } = await supabase.from("board_pages").insert({ ...scope(n), name: "" }).select("id, user_id, board_id, page, name").single();
-      if (error) throw error;
-      if (data && alive.current) setRows((prev) => (prev.some((r) => r.page === n) ? prev : [...prev, data as PageRow]));
-      setPage(n);
-      return null;
-    } catch (e) {
-      console.error(e);
-      return pagesErrorText(e);
-    }
-  }, [enabled, pages, ensureRows, scope, setPage]);
+    ensureRows(pages.map((p) => p.page));
+    pageInsert(scope, n, "");
+    setPage(n);
+    return null;
+  }, [enabled, readOnly, pages, ensureRows, scope, setPage]);
 
   const rename = useCallback(
     async (p: number, name: string): Promise<string | null> => {
+      if (readOnly) return NO_NET;
       const clean = name.trim().slice(0, PAGE_NAME_MAX);
-      try {
-        const row = rows.find((r) => r.page === p);
-        if (row) {
-          setRows((prev) => prev.map((r) => (r.id === row.id ? { ...r, name: clean } : r)));
-          const { error } = await supabase.from("board_pages").update({ name: clean }).eq("id", row.id);
-          if (error) throw error;
-        } else {
-          const { data, error } = await supabase.from("board_pages").insert({ ...scope(p), name: clean }).select("id, user_id, board_id, page, name").single();
-          if (error) throw error;
-          if (data) setRows((prev) => [...prev.filter((r) => r.page !== p), data as PageRow]);
-        }
-        return null;
-      } catch (e) {
-        console.error(e);
-        load();
-        return pagesErrorText(e);
-      }
+      const row = rows.find((r) => r.page === p);
+      if (row) pageRename(row.id, clean);
+      else pageInsert(scope, p, clean);
+      return null;
     },
-    [rows, scope, load]
+    [rows, scope, readOnly]
   );
 
   const remove = useCallback(
     async (p: number): Promise<string | null> => {
+      if (readOnly) return NO_NET;
+      const inScope = (n: { board?: string; board_id?: string | null; user_id?: string | null }) =>
+        view === "shared" ? n.board_id === boardId : n.board === "private" && n.user_id === userId;
+      const busy =
+        local.notes.all().some((n) => (n.page ?? 1) === p && inScope(n)) ||
+        local.connections.all().some((c) => (c.page ?? 1) === p && inScope(c)) ||
+        (view === "private" && (local.drawings.get(`${userId}|${p}`)?.strokes.length ?? 0) > 0);
+      if (busy) return NOT_EMPTY;
       const row = rows.find((r) => r.page === p);
-      if (!row) return "Страница не пустая: сначала уберите стикеры, нити и рисунок";
-      const { error } = await supabase.from("board_pages").delete().eq("id", row.id);
-      if (error) {
-        console.error(error);
-        return pagesErrorText(error);
-      }
-      setRows((prev) => prev.filter((r) => r.id !== row.id));
+      if (!row) return NOT_EMPTY;
+      pageDelete(row.id);
       return null;
     },
-    [rows]
+    [rows, readOnly, view, boardId, userId]
   );
 
-  return { pages, page, index, setPage, go, add, rename, remove, reload: load };
+  const reload = useCallback(async () => undefined, []);
+
+  return { pages, page, index, setPage, go, add, rename, remove, reload };
 }
 
 export type PagesApi = ReturnType<typeof useBoardPages>;

@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "./supabase";
+import { local, useTable, usePendingOps } from "./localdb";
+import { isOnline } from "./sync";
+import { settingsPatch } from "./data";
 import { compressImage } from "./photos";
 
 export const BACKGROUNDS_BUCKET = "backgrounds";
@@ -120,8 +123,6 @@ export function useBackground(userId: string, paused: boolean) {
   bgRef.current = bg;
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
-  const saveTimer = useRef<number | null>(null);
-  const dirty = useRef(false);
   const signed = useRef<{ path: string; at: number } | null>(null);
 
   const sign = useCallback(async (path: string | undefined) => {
@@ -130,13 +131,36 @@ export function useBackground(userId: string, paused: boolean) {
       setPhotoUrl(null);
       return;
     }
+    const urlKey = `sticky-bgurl-${path}`;
+    const cached = (() => {
+      try {
+        const v = JSON.parse(localStorage.getItem(urlKey) || "null");
+        return v && typeof v.url === "string" ? (v as { url: string; at: number }) : null;
+      } catch {
+        return null;
+      }
+    })();
+    if (!isOnline() && cached) {
+      signed.current = { path, at: cached.at };
+      setPhotoUrl(cached.url);
+      return;
+    }
     const { data, error: e } = await supabase.storage.from(BACKGROUNDS_BUCKET).createSignedUrl(path, SIGN_TTL);
     if (e || !data?.signedUrl) {
       console.error("Стикеры: не удалось получить ссылку на фон", e);
+      if (cached) {
+        signed.current = { path, at: cached.at };
+        setPhotoUrl(cached.url);
+      }
       return;
     }
     signed.current = { path, at: Date.now() };
     setPhotoUrl(data.signedUrl);
+    try {
+      localStorage.setItem(urlKey, JSON.stringify({ url: data.signedUrl, at: Date.now() }));
+    } catch {
+      /* storage may be unavailable */
+    }
   }, []);
 
   useEffect(() => {
@@ -148,64 +172,37 @@ export function useBackground(userId: string, paused: boolean) {
     }
   }, [bg.kind, bg.path, sign]);
 
-  const save = useCallback(
-    async (next: BgSettings) => {
-      const { error: e } = await supabase.rpc("update_my_settings", { p_patch: { background: next } });
-      if (e) {
-        console.error("Стикеры: не удалось сохранить фон", e);
-        setError("Не удалось сохранить фон. Он останется на этом устройстве");
-      } else {
-        dirty.current = false;
-      }
-    },
-    []
-  );
-
   const apply = useCallback(
     (next: BgSettings) => {
       setBgState(next);
       bgRef.current = next;
       writeCache(userId, next);
-      dirty.current = true;
-      if (saveTimer.current) window.clearTimeout(saveTimer.current);
-      saveTimer.current = window.setTimeout(() => save(bgRef.current), 500);
+      settingsPatch({ background: next }); // local first, the queue sends it
     },
-    [save, userId]
-  );
-  useEffect(
-    () => () => {
-      if (saveTimer.current) {
-        window.clearTimeout(saveTimer.current);
-        if (dirty.current) void save(bgRef.current);
-      }
-    },
-    [save]
+    [userId]
   );
 
-  // pull from the server: first load, window focus, every minute
-  const pull = useCallback(async () => {
-    if (pausedRef.current || dirty.current) return;
-    const { data, error: e } = await supabase.rpc("get_my_settings");
-    if (e || !data || typeof data !== "object") return;
-    const remote = sanitizeBg((data as { background?: unknown }).background);
+  // what the account says (written by the synchronisation) -> this device; photo links are refreshed now and then
+  const meta = useTable(local.meta);
+  const ops = usePendingOps();
+  useEffect(() => {
+    if (pausedRef.current || ops.some((o) => o.table === "settings")) return;
+    const settings = meta.find((m) => m.key === "settings")?.value as { background?: unknown } | undefined;
+    if (!settings || !meta.some((m) => m.key === "lastSync")) return;
+    const remote = sanitizeBg(settings.background);
     if (JSON.stringify(remote) !== JSON.stringify(bgRef.current)) {
       setBgState(remote);
       bgRef.current = remote;
       writeCache(userId, remote);
-    } else if (remote.kind === "photo" && signed.current && Date.now() - signed.current.at > SIGN_REFRESH_MS) {
-      sign(remote.path);
     }
-  }, [sign, userId]);
+  }, [meta, ops, userId, paused]);
   useEffect(() => {
-    pull();
-    const onFocus = () => pull();
-    window.addEventListener("focus", onFocus);
-    const t = window.setInterval(pull, 60000);
-    return () => {
-      window.removeEventListener("focus", onFocus);
-      window.clearInterval(t);
-    };
-  }, [pull]);
+    const t = window.setInterval(() => {
+      const cur = bgRef.current;
+      if (cur.kind === "photo" && signed.current && isOnline() && Date.now() - signed.current.at > SIGN_REFRESH_MS) void sign(cur.path);
+    }, 60000);
+    return () => window.clearInterval(t);
+  }, [sign]);
 
   const removeFile = useCallback((path: string | undefined) => {
     if (path) void supabase.storage.from(BACKGROUNDS_BUCKET).remove([path]);
@@ -225,6 +222,7 @@ export function useBackground(userId: string, paused: boolean) {
     async (file: File): Promise<string | null> => {
       if (!file.type.startsWith("image/")) return bgErrorText(new Error("TYPE"));
       if (file.size > BG_MAX_BYTES) return bgErrorText(new Error("BIG"));
+      if (!isOnline()) return "Нет сети: фото для фона можно загрузить, когда появится интернет";
       setUploading(true);
       try {
         const { blob } = await compressImage(file, BG_MAX_SIDE);

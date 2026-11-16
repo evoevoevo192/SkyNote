@@ -1,3 +1,4 @@
+import { localUrl } from "../lib/localdb";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { MoveToPage } from "./Pages";
 import type { PageInfo } from "../lib/pages";
@@ -483,7 +484,7 @@ export function PhotoViewer({ photos, startId, onClose }: PhotoViewerProps) {
         <img
           ref={imgRef}
           className="pv-img"
-          src={photo.url}
+          src={localUrl(photo.url)}
           alt={photo.caption || "Фото"}
           draggable={false}
           style={{

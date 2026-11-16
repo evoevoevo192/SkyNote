@@ -1,3 +1,4 @@
+import { InstallRow } from "./SyncUi";
 import { useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import {
@@ -475,6 +476,9 @@ export function ProfileDialog({ username, api, onClose, notify }: ProfileDialogP
           Заблокированные
           {api.blocked.length > 0 && <span className="fr-count">{api.blocked.length}</span>}
         </button>
+
+        <div className="fr-id-label">Приложение</div>
+        <InstallRow notify={notify} />
       </div>
     </Sheet>
   );

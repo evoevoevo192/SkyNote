@@ -15,6 +15,28 @@ interface ChipsProps {
   onManage: (id: string) => void;
 }
 
+/** Shown on the "Доски" tab when no board is open: offers to create one for oneself or with friends. */
+export function BoardOffer({ hasBoards, online, onCreate }: { hasBoards: boolean; online: boolean; onCreate: (mode: "solo" | "friends") => void }) {
+  return (
+    <div className="board-offer">
+      <div className="big">{hasBoards ? "Выберите доску или создайте новую" : "Создайте первую доску"}</div>
+      <div className="board-offer-cards">
+        <button className="board-offer-card" disabled={!online} onClick={() => onCreate("solo")}>
+          <span className="board-offer-ico" aria-hidden="true">📌</span>
+          <strong>Для себя</strong>
+          <span>Личная доска для заметок и идей</span>
+        </button>
+        <button className="board-offer-card" disabled={!online} onClick={() => onCreate("friends")}>
+          <span className="board-offer-ico" aria-hidden="true">👥</span>
+          <strong>С друзьями</strong>
+          <span>Общая доска: пишите и рисуйте вместе</span>
+        </button>
+      </div>
+      {!online && <div className="board-offer-note">Нет сети: доски можно создавать, когда появится интернет.</div>}
+    </div>
+  );
+}
+
 export function BoardChips({ boards, activeId, onPick, onNew, onManage }: ChipsProps) {
   return (
     <nav className="board-chips" aria-label="Доски">
@@ -37,6 +59,7 @@ export function BoardChips({ boards, activeId, onPick, onNew, onManage }: ChipsP
 
 // ---------- new board ----------
 interface NewProps {
+  initialMode?: "solo" | "friends";
   friends: FriendsApi;
   boards: BoardsApi;
   onClose: () => void;
@@ -44,7 +67,8 @@ interface NewProps {
   notify: Notify;
 }
 
-export function NewBoardDialog({ friends, boards, onClose, onCreated, notify }: NewProps) {
+export function NewBoardDialog({ initialMode = "solo", friends, boards, onClose, onCreated, notify }: NewProps) {
+  const [mode, setMode] = useState<"solo" | "friends">(initialMode);
   const [name, setName] = useState("");
   const [picked, setPicked] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
@@ -61,7 +85,7 @@ export function NewBoardDialog({ friends, boards, onClose, onCreated, notify }: 
     }
     setBusy(true);
     setError(null);
-    const res = await boards.create(clean, picked);
+    const res = await boards.create(clean, mode === "friends" ? picked : []);
     setBusy(false);
     if (res.error || !res.id) {
       setError(res.error ?? "Не удалось создать доску");
@@ -80,6 +104,16 @@ export function NewBoardDialog({ friends, boards, onClose, onCreated, notify }: 
           submit();
         }}
       >
+        <div className="board-mode" role="radiogroup" aria-label="Для кого доска">
+          <button type="button" role="radio" aria-checked={mode === "solo"} className={`board-mode-btn${mode === "solo" ? " on" : ""}`} onClick={() => setMode("solo")}>
+            <strong>Для себя</strong>
+            <span>Личная доска, людей можно добавить позже</span>
+          </button>
+          <button type="button" role="radio" aria-checked={mode === "friends"} className={`board-mode-btn${mode === "friends" ? " on" : ""}`} onClick={() => setMode("friends")}>
+            <strong>С друзьями</strong>
+            <span>Общая доска: вы и выбранные друзья</span>
+          </button>
+        </div>
         <label className="fr-field">
           Название
           <input
@@ -91,15 +125,17 @@ export function NewBoardDialog({ friends, boards, onClose, onCreated, notify }: 
             autoFocus
           />
         </label>
-        <div className="fr-section">
-          Друзья на доске · {picked.length} из {BOARD_MAX_FRIENDS}
-        </div>
-        {friends.loading && <div className="fr-empty"><Spinner /> Загрузка…</div>}
-        {!friends.loading && friends.friends.length === 0 && (
-          <p className="fr-hint">Друзей пока нет. Доску можно создать и одному, а людей добавить позже.</p>
+        {mode === "friends" && (
+          <div className="fr-section">
+            Друзья на доске · {picked.length} из {BOARD_MAX_FRIENDS}
+          </div>
+        )}
+        {mode === "friends" && friends.loading && <div className="fr-empty"><Spinner /> Загрузка…</div>}
+        {mode === "friends" && !friends.loading && friends.friends.length === 0 && (
+          <p className="fr-hint">Друзей пока нет. Можно создать доску для себя, а друзей добавить позже в настройках доски.</p>
         )}
         <ul className="fr-list">
-          {friends.friends.map((f) => {
+          {(mode === "friends" ? friends.friends : []).map((f) => {
             const on = picked.includes(f.person.id);
             const locked = !on && picked.length >= BOARD_MAX_FRIENDS;
             return (
@@ -121,7 +157,7 @@ export function NewBoardDialog({ friends, boards, onClose, onCreated, notify }: 
         </ul>
         {error && <div className="fr-error" role="alert">{error}</div>}
         <button className="fr-btn primary fr-wide" type="submit" disabled={busy}>
-          {busy && <Spinner />} Создать доску
+          {busy && <Spinner />} {mode === "solo" ? "Создать доску для себя" : "Создать доску с друзьями"}
         </button>
       </form>
     </Sheet>

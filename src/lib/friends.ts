@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./supabase";
+import { local } from "./localdb";
 
 export type FriendshipStatus = "pending" | "accepted" | "blocked";
 
@@ -62,9 +63,9 @@ export function friendsErrorText(error: unknown): string {
 }
 
 export function formatLastActive(iso: string | null): string {
-  if (!iso) return "Нет активности на общей доске";
+  if (!iso) return "Нет активности";
   const t = new Date(iso).getTime();
-  if (Number.isNaN(t)) return "Нет активности на общей доске";
+  if (Number.isNaN(t)) return "Нет активности";
   const minutes = Math.max(0, Math.floor((Date.now() - t) / 60000));
   if (minutes < 2) return "Был(а) активен(на) только что";
   if (minutes < 60) return `Активность: ${minutes} мин назад`;
@@ -77,17 +78,19 @@ export function formatLastActive(iso: string | null): string {
 
 export async function fetchMyPublicId(): Promise<string | null> {
   const { data, error } = await supabase.rpc("get_my_public_id");
-  if (error || typeof data !== "string") return null;
+  if (error || typeof data !== "string") return local.getMeta<string>("publicId") ?? null; // offline: last known
+  local.setMeta("publicId", data);
   return data;
 }
 
 type MutationResult = PromiseLike<{ error: unknown }>;
 
 export function useFriends(userId: string) {
-  const [rows, setRows] = useState<Friendship[]>([]);
-  const [people, setPeople] = useState<Record<string, Person>>({});
-  const [activity, setActivity] = useState<Record<string, string>>({});
-  const [loading, setLoading] = useState(true);
+  const cached = local.getMeta<{ list: Friendship[]; people: Record<string, Person>; activity: Record<string, string> }>("friends");
+  const [rows, setRows] = useState<Friendship[]>(cached?.list ?? []);
+  const [people, setPeople] = useState<Record<string, Person>>(cached?.people ?? {});
+  const [activity, setActivity] = useState<Record<string, string>>(cached?.activity ?? {});
+  const [loading, setLoading] = useState(!cached);
   const [loadError, setLoadError] = useState<string | null>(null);
   const alive = useRef(true);
 
@@ -122,9 +125,10 @@ export function useFriends(userId: string) {
       setPeople(nextPeople);
       setActivity(nextActivity);
       setLoadError(null);
+      local.setMeta("friends", { list, people: nextPeople, activity: nextActivity }); // last known state for offline
     } catch (e) {
       console.error("Стикеры: не удалось загрузить друзей", e);
-      if (alive.current) setLoadError("Не удалось загрузить список друзей");
+      if (alive.current) setLoadError(local.getMeta("friends") ? null : "Не удалось загрузить список друзей");
     } finally {
       if (alive.current) setLoading(false);
     }

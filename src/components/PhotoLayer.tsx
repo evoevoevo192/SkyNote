@@ -1,3 +1,4 @@
+import { localUrl } from "../lib/localdb";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { NotePhoto } from "../lib/supabase";
 
@@ -161,7 +162,7 @@ export function PhotoLayer({
             startMove(e);
           }}
         >
-          <img src={photo.url} alt="" draggable={false} className="photo-img" style={{ touchAction: "none" }} />
+          <img src={localUrl(photo.url)} alt="" draggable={false} className="photo-img" style={{ touchAction: "none" }} />
           {selected && canEdit && (
             <>
               <button

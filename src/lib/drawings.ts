@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { supabase } from "./supabase";
+import { local, useTable, usePendingOps } from "./localdb";
+import { useOnline } from "./sync";
+import { drawingSave, drawKey } from "./data";
 
 export type StrokeTool = "pen" | "marker";
 
@@ -42,58 +44,45 @@ function sanitize(raw: unknown): Stroke[] {
 
 export type SaveState = "idle" | "saving" | "saved" | "error";
 
-/** Strokes of the private board: undo/redo history, debounced autosave (800 ms), reload on focus. */
+/**
+ * Strokes of the private board page: undo/redo history; the drawing lives in the local database,
+ * every change is saved there at once and sent to the server by the sync queue.
+ */
 export function useDrawings(userId: string, page = 1) {
-  const [strokes, setStrokesState] = useState<Stroke[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [saveState, setSaveState] = useState<SaveState>("idle");
-  const [, setTick] = useState(0);
+  useTable(local.drawings); // re-render when the drawing changes (also when it arrives from another device)
+  const ops = usePendingOps();
+  const online = useOnline();
+  const key = drawKey(userId, page);
+  const row = local.drawings.get(key);
   const cur = useRef<Stroke[]>([]);
   const hist = useRef<{ stack: Stroke[][]; idx: number }>({ stack: [[]], idx: 0 });
-  const timer = useRef<number | null>(null);
-  const dirty = useRef(false);
-  const saving = useRef(false);
-  const pageRef = useRef(page);
-  const shownPage = useRef(page);
+  const mineAt = useRef<string | null>(null);
+  const shownKey = useRef<string | null>(null);
+  const touched = useRef(false);
+  const [, setTick] = useState(0);
 
-  const save = useCallback(async () => {
-    if (timer.current) window.clearTimeout(timer.current);
-    timer.current = null;
-    if (!dirty.current) return;
-    if (saving.current) {
-      timer.current = window.setTimeout(save, 300);
-      return;
-    }
-    dirty.current = false;
-    saving.current = true;
-    setSaveState("saving");
-    const pg = pageRef.current;
-    const { error } = await supabase
-      .from("drawings")
-      .upsert({ user_id: userId, page: pg, strokes: cur.current, updated_at: new Date().toISOString() }, { onConflict: "user_id,page" });
-    saving.current = false;
-    if (error) {
-      console.error("Стикеры: не удалось сохранить рисунок", error);
-      if (pageRef.current === pg) dirty.current = true;
-      setSaveState("error");
-    } else {
-      setSaveState(dirty.current ? "saving" : "saved");
-    }
-  }, [userId]);
+  if (shownKey.current !== key) {
+    shownKey.current = key;
+    cur.current = sanitize(row?.strokes);
+    hist.current = { stack: [cur.current], idx: 0 };
+    mineAt.current = row?.updated_at ?? null;
+    touched.current = false;
+  } else if (row && row.updated_at !== mineAt.current) {
+    // came from the server / another tab
+    cur.current = sanitize(row.strokes);
+    hist.current = { stack: [cur.current], idx: 0 };
+    mineAt.current = row.updated_at;
+  }
 
-  const schedule = useCallback(() => {
-    dirty.current = true;
-    setSaveState("saving");
-    if (timer.current) window.clearTimeout(timer.current);
-    timer.current = window.setTimeout(save, SAVE_DELAY_MS);
-  }, [save]);
-
-  const apply = (next: Stroke[]) => {
-    cur.current = next;
-    setStrokesState(next);
-    setTick((t) => t + 1);
-    schedule();
-  };
+  const apply = useCallback(
+    (next: Stroke[]) => {
+      cur.current = next;
+      touched.current = true;
+      mineAt.current = drawingSave(userId, page, next);
+      setTick((t) => t + 1);
+    },
+    [userId, page]
+  );
 
   /** Records a new state as one undo step. */
   const commit = useCallback(
@@ -103,8 +92,7 @@ export function useDrawings(userId: string, page = 1) {
       h.idx = h.stack.length - 1;
       apply(next);
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [schedule]
+    [apply]
   );
   const undo = useCallback(() => {
     const h = hist.current;
@@ -112,76 +100,41 @@ export function useDrawings(userId: string, page = 1) {
       h.idx -= 1;
       apply(h.stack[h.idx]);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [schedule]);
+  }, [apply]);
   const redo = useCallback(() => {
     const h = hist.current;
     if (h.idx < h.stack.length - 1) {
       h.idx += 1;
       apply(h.stack[h.idx]);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [schedule]);
+  }, [apply]);
 
-  const load = useCallback(async (force = false) => {
-    if (!force && (dirty.current || saving.current)) return;
-    const pg = pageRef.current;
-    const { data, error } = await supabase.from("drawings").select("strokes").eq("user_id", userId).eq("page", pg).maybeSingle();
-    if (error) {
-      console.error("Стикеры: не удалось загрузить рисунок", error);
-      setLoaded(true);
-      return;
-    }
-    if (pageRef.current !== pg) return;
-    if (dirty.current || (!force && saving.current)) return;
-    const remote = sanitize((data as { strokes?: unknown } | null)?.strokes);
-    if (JSON.stringify(remote) !== JSON.stringify(cur.current)) {
-      cur.current = remote;
-      setStrokesState(remote);
-      hist.current = { stack: [remote], idx: 0 };
-    }
-    setLoaded(true);
-  }, [userId]);
+  const flush = useCallback(async () => {
+    await local.flush();
+  }, []);
 
   useEffect(() => {
-    // (the cleanup of the previous run has already saved the old page: pageRef still holds it)
-    pageRef.current = page;
-    if (shownPage.current !== page) {
-      shownPage.current = page;
-      cur.current = [];
-      setStrokesState([]);
-      hist.current = { stack: [[]], idx: 0 };
-      dirty.current = false;
-      setLoaded(false);
-      setSaveState("idle");
-      void load(true);
-    } else {
-      void load();
-    }
-    const onFocus = () => load();
-    const onHide = () => {
-      if (dirty.current) void save();
-    };
-    window.addEventListener("focus", onFocus);
+    const onHide = () => void local.flush();
     window.addEventListener("pagehide", onHide);
     document.addEventListener("visibilitychange", onHide);
     return () => {
-      window.removeEventListener("focus", onFocus);
       window.removeEventListener("pagehide", onHide);
       document.removeEventListener("visibilitychange", onHide);
-      if (dirty.current) void save();
     };
-  }, [load, save, page]);
+  }, []);
+
+  const waiting = ops.some((o) => o.table === "drawings" && o.id === key);
+  const saveState = (!touched.current ? "idle" : waiting && online ? "saving" : "saved") as SaveState;
 
   const h = hist.current;
   return {
-    strokes,
-    loaded,
+    strokes: cur.current,
+    loaded: true,
     saveState,
     commit,
     undo,
     redo,
-    flush: save,
+    flush,
     canUndo: h.idx > 0,
     canRedo: h.idx < h.stack.length - 1,
   };

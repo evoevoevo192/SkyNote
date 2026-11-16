@@ -63,6 +63,7 @@ export interface Note {
   width?: number;
   aspect?: number | null;
   caption?: string | null;
+  locked?: boolean; // sticker is closed by a code: title/body/photos are empty here, the real ones live in note_locks
   created_at: string;
   updated_at: string;
 }

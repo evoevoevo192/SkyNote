@@ -27,7 +27,7 @@ const Ico = ({ d, size = 22 }: { d: string; size?: number }) => (
 );
 
 /** Strokes are stored divided by the canvas width, so px = value * width. */
-function paint(ctx: CanvasRenderingContext2D, s: Stroke, W: number) {
+export function paint(ctx: CanvasRenderingContext2D, s: Stroke, W: number) {
   const width = s.t === "marker" ? s.w * MARKER_FACTOR : s.w;
   ctx.save();
   ctx.lineCap = "round";

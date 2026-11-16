@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { supabase } from "./supabase";
+import { local, useTable, usePendingOps } from "./localdb";
+import { settingsPatch } from "./data";
 
 export type UIStyle = "modern" | "original" | "skeuo";
 export const UI_STYLES: UIStyle[] = ["modern", "original", "skeuo"];
@@ -34,22 +35,25 @@ export function applyStyle(style: UIStyle, animate: boolean) {
   root.setAttribute("data-style", style);
 }
 
-/** Interface style: localStorage (instant, also before login) + profiles.settings.style (other devices). */
+/** Interface style: localStorage (instant, also before login) + profiles.settings.style (other devices) via the sync queue. */
 export function useUiStyle(userId: string) {
   const [style, setStyleState] = useState<UIStyle>(() => readStoredStyle());
   const ref = useRef(style);
   ref.current = style;
-  const dirty = useRef(false);
+  const meta = useTable(local.meta);
+  const ops = usePendingOps();
 
   useEffect(() => {
     applyStyle(style, true);
   }, [style]);
 
-  const pull = useCallback(async () => {
-    if (dirty.current) return;
-    const { data, error } = await supabase.rpc("get_my_settings");
-    if (error || !data || typeof data !== "object") return;
-    const remote = (data as { style?: unknown }).style;
+  // what the account says (written by the synchronisation) -> this device
+  useEffect(() => {
+    if (ops.some((o) => o.table === "settings")) return; // my change is on its way
+    const settings = meta.find((m) => m.key === "settings")?.value as { style?: unknown } | undefined;
+    const synced = meta.some((m) => m.key === "lastSync");
+    if (!settings || !synced) return;
+    const remote = settings.style;
     if (isStyle(remote)) {
       if (remote !== ref.current) {
         try {
@@ -60,16 +64,9 @@ export function useUiStyle(userId: string) {
         setStyleState(remote);
       }
     } else if (ref.current !== DEFAULT_STYLE) {
-      void supabase.rpc("update_my_settings", { p_patch: { style: ref.current } });
+      settingsPatch({ style: ref.current });
     }
-  }, []);
-
-  useEffect(() => {
-    pull();
-    const onFocus = () => pull();
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
-  }, [pull, userId]);
+  }, [meta, ops, userId]);
 
   const setStyle = useCallback(async (next: UIStyle) => {
     if (next === ref.current) return;
@@ -80,10 +77,7 @@ export function useUiStyle(userId: string) {
     }
     setStyleState(next);
     ref.current = next;
-    dirty.current = true;
-    const { error } = await supabase.rpc("update_my_settings", { p_patch: { style: next } });
-    if (error) console.error("Стикеры: не удалось сохранить стиль", error);
-    dirty.current = false;
+    settingsPatch({ style: next });
   }, []);
 
   return { style, setStyle };

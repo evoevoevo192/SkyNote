@@ -75,10 +75,11 @@ interface MenuProps {
   /** objects on every page (to know which pages are empty) */
   counts: Record<number, number>;
   onClose: () => void;
+  onExport: () => void;
   notify: Notify;
 }
 
-export function PageMenu({ api, counts, onClose, notify }: MenuProps) {
+export function PageMenu({ api, counts, onClose, onExport, notify }: MenuProps) {
   const { pages, page, index } = api;
   const cur = pages[index];
   const [name, setName] = useState(cur?.name ?? "");
@@ -112,6 +113,7 @@ export function PageMenu({ api, counts, onClose, notify }: MenuProps) {
 
   return (
     <Sheet title="Страницы" onClose={onClose}>
+      <button className="fr-btn pg-export" onClick={onExport}>Экспорт доски…</button>
       <div className="pg-list" role="list">
         {pages.map((p, i) => (
           <button

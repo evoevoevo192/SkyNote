@@ -1,3 +1,6 @@
+import { local } from "./localdb";
+import { stageImage } from "./data";
+import { isLocalUrl } from "./sync";
 import { supabase, IMAGES_BUCKET, PHOTOS_BUCKET, type NotePhoto } from "./supabase";
 
 const MAX_SIDE = 1600;
@@ -28,6 +31,7 @@ export async function compressImage(file: File, maxSide: number = MAX_SIDE): Pro
   return { blob, width: w, height: h };
 }
 
+/** Sticker attachment: the compressed file is kept on the device and uploaded by the sync queue. */
 export async function uploadPhoto(
   file: File,
   ownerId: string,
@@ -35,24 +39,24 @@ export async function uploadPhoto(
 ): Promise<NotePhoto> {
   const { blob } = await compressImage(file);
   const path = `${ownerId || "anon"}/${noteId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
-  const { error } = await supabase.storage
-    .from(IMAGES_BUCKET)
-    .upload(path, blob, { contentType: "image/jpeg", upsert: false });
-  if (error) throw error;
-  const { data } = supabase.storage.from(IMAGES_BUCKET).getPublicUrl(path);
-  return {
-    url: data.publicUrl,
-    path,
-    x: 10,
-    y: 45,
-    width: 80,
-  };
+  const url = stageImage(blob, IMAGES_BUCKET, path);
+  return { url, path, x: 10, y: 45, width: 80 };
 }
 
 export async function removePhotoPaths(paths: string[]): Promise<void> {
   if (!paths.length) return;
   const { error } = await supabase.storage.from(IMAGES_BUCKET).remove(paths);
   if (error) console.error("Не удалось удалить файлы фото", error);
+}
+
+/** Removes a sticker attachment's file: a not yet uploaded one is simply forgotten. */
+export function removeStickerPhoto(photo: NotePhoto): void {
+  if (isLocalUrl(photo.url)) {
+    local.removeOpsFor("upload", photo.url);
+    local.removeBlob(photo.url);
+    return;
+  }
+  void removePhotoPaths([photo.path]);
 }
 
 export function defaultPhotosFromLegacy(imagePath: string | null, imageUrl: string | null): NotePhoto[] {
@@ -85,16 +89,12 @@ function newId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/** Compresses (1600px, JPEG 0.85) and uploads to photos/<userId>/<uuid>.jpg. */
+/** Compresses (1600px, JPEG 0.85) and keeps the file locally; the sync queue uploads it to photos/<userId>/<uuid>.jpg. */
 export async function uploadBoardPhoto(file: File, userId: string): Promise<{ url: string; aspect: number }> {
   const { blob, width, height } = await compressImage(file);
   const path = `${userId}/${newId()}.jpg`;
-  const { error } = await supabase.storage
-    .from(PHOTOS_BUCKET)
-    .upload(path, blob, { contentType: "image/jpeg", upsert: false });
-  if (error) throw error;
-  const { data } = supabase.storage.from(PHOTOS_BUCKET).getPublicUrl(path);
-  return { url: data.publicUrl, aspect: width / height };
+  const url = stageImage(blob, PHOTOS_BUCKET, path);
+  return { url, aspect: width / height };
 }
 
 export function photoPathFromUrl(url: string): string | null {
@@ -106,6 +106,11 @@ export function photoPathFromUrl(url: string): string | null {
 }
 
 export async function removeBoardPhoto(url: string): Promise<void> {
+  if (isLocalUrl(url)) {
+    local.removeOpsFor("upload", url);
+    local.removeBlob(url);
+    return;
+  }
   const path = photoPathFromUrl(url);
   if (!path) return;
   const { error } = await supabase.storage.from(PHOTOS_BUCKET).remove([path]);
